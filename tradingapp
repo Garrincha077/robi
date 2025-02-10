@@ -1,0 +1,794 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog, filedialog
+import sqlite3
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+import threading
+import time
+import logging
+from datetime import datetime
+from ttkthemes import ThemedTk
+
+# Database setup
+conn = sqlite3.connect('trading_app.db', check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS portfolio (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        entry_price REAL,
+        stop_loss REAL,
+        take_profit REAL,
+        quantity INTEGER,
+        entry_date TEXT,
+        exit_date TEXT,
+        pnl REAL,
+        status TEXT
+    )
+''')
+conn.commit()
+
+# Logging setup
+logging.basicConfig(filename='trading_app.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Helper Functions
+def fetch_real_time_price(symbol):
+    """Fetch real-time price for a stock."""
+    try:
+        ticker = yf.Ticker(symbol)
+        data = ticker.history(period='1d')
+        if data.empty:
+            return None
+        return data['Close'].iloc[-1]
+    except Exception as e:
+        logging.error(f"Error fetching price for {symbol}: {e}")
+        return None
+
+def calculate_atr(data, period=14):
+    """Calculate ATR (Average True Range)."""
+    if data.empty:
+        return None
+    high_low = data['High'] - data['Low']
+    high_close = np.abs(data['High'] - data['Close'].shift())
+    low_close = np.abs(data['Low'] - data['Close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    atr = true_range.rolling(window=period).mean()
+    return atr.iloc[-1]
+
+def calculate_position_size(account_balance, risk_percentage, stop_loss, current_price):
+    """Calculate position size based on risk management."""
+    risk_per_trade = account_balance * (risk_percentage / 100)
+    risk_per_share = abs(current_price - stop_loss)
+    if risk_per_share == 0:
+        return 0
+    return int(risk_per_trade / risk_per_share)
+
+# Position Calculator Tab
+class PositionCalculatorTab(ttk.Frame):
+    def __init__(self, parent, account_balance, risk_percentage, portfolio_tracker):
+        super().__init__(parent)
+        self.account_balance = account_balance
+        self.risk_percentage = risk_percentage
+        self.portfolio_tracker = portfolio_tracker
+
+        # Styling
+        style = ttk.Style()
+        style.configure('TLabel', font=('Helvetica', 12))
+        style.configure('TButton', font=('Helvetica', 12))
+        style.configure('TEntry', font=('Helvetica', 12))
+        style.configure('TFrame', borderwidth=2, relief="groove")
+
+        # Main Frame
+        main_frame = ttk.Frame(self)
+        main_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        # Symbol Entry
+        symbol_frame = ttk.Frame(main_frame)
+        symbol_frame.pack(pady=5, fill="x")
+        ttk.Label(symbol_frame, text="Symbol:").pack(side="left", padx=10, pady=5)
+        self.symbol_entry = ttk.Entry(symbol_frame)
+        self.symbol_entry.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+        self.fetch_price_button = ttk.Button(symbol_frame, text="Fetch Price", command=self.fetch_price)
+        self.fetch_price_button.pack(side="left", padx=10, pady=5)
+
+        # Entry Price Entry
+        entry_price_frame = ttk.Frame(main_frame)
+        entry_price_frame.pack(pady=5, fill="x")
+        ttk.Label(entry_price_frame, text="Entry Price:").pack(side="left", padx=10, pady=5)
+        self.entry_price_entry = ttk.Entry(entry_price_frame)
+        self.entry_price_entry.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+
+        # Stop Loss Type
+        stop_loss_type_frame = ttk.Frame(main_frame)
+        stop_loss_type_frame.pack(pady=5, fill="x")
+        ttk.Label(stop_loss_type_frame, text="Stop Loss Type:").pack(side="left", padx=10, pady=5)
+        self.stop_loss_type = tk.StringVar(value="Percentage")
+        ttk.Radiobutton(stop_loss_type_frame, text="Percentage", variable=self.stop_loss_type, value="Percentage").pack(side="left", padx=10, pady=5)
+        ttk.Radiobutton(stop_loss_type_frame, text="ATR", variable=self.stop_loss_type, value="ATR").pack(side="left", padx=10, pady=5)
+
+        # ATR Timeframe Selection
+        atr_timeframe_frame = ttk.Frame(main_frame)
+        atr_timeframe_frame.pack(pady=5, fill="x")
+        ttk.Label(atr_timeframe_frame, text="ATR Timeframe:").pack(side="left", padx=10, pady=5)
+        self.atr_timeframe = ttk.Combobox(atr_timeframe_frame, values=["5m", "15m", "1h", "1d", "1wk"], state="readonly")
+        self.atr_timeframe.set("1d")  # Default value
+        self.atr_timeframe.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+
+        # Stop Loss Value Entry
+        stop_loss_value_frame = ttk.Frame(main_frame)
+        stop_loss_value_frame.pack(pady=5, fill="x")
+        ttk.Label(stop_loss_value_frame, text="Stop Loss Value:").pack(side="left", padx=10, pady=5)
+        self.stop_loss_value_entry = ttk.Entry(stop_loss_value_frame)
+        self.stop_loss_value_entry.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+
+        # Take Profit Entry
+        take_profit_frame = ttk.Frame(main_frame)
+        take_profit_frame.pack(pady=5, fill="x")
+        ttk.Label(take_profit_frame, text="Take Profit:").pack(side="left", padx=10, pady=5)
+        self.take_profit_entry = ttk.Entry(take_profit_frame)
+        self.take_profit_entry.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+
+        # Risk Percentage Slider
+        risk_frame = ttk.Frame(main_frame)
+        risk_frame.pack(pady=5, fill="x")
+        ttk.Label(risk_frame, text="Risk Percentage:").pack(side="left", padx=10, pady=5)
+        self.risk_slider = ttk.Scale(risk_frame, from_=0.1, to=10, orient="horizontal", length=300, command=self.update_risk_percentage)
+        self.risk_slider.set(self.risk_percentage)
+        self.risk_slider.pack(side="left", padx=10, pady=5)
+        self.risk_label = ttk.Label(risk_frame, text=f"{self.risk_percentage}%")
+        self.risk_label.pack(side="left", padx=10, pady=5)
+
+        # Calculate Button
+        self.calculate_button = ttk.Button(main_frame, text="Calculate", command=self.calculate_position)
+        self.calculate_button.pack(pady=20)
+
+        # Detailed Output
+        self.result_frame = ttk.Frame(main_frame)
+        self.result_frame.pack(pady=10, fill="both", expand=True)
+        ttk.Label(self.result_frame, text="Calculated Details:", font=('Helvetica', 14, 'bold')).pack(pady=10)
+        self.position_size_label = ttk.Label(self.result_frame, text="Position Size: ")
+        self.position_size_label.pack(pady=5)
+        self.stop_loss_label = ttk.Label(self.result_frame, text="Stop Loss: ")
+        self.stop_loss_label.pack(pady=5)
+        self.risk_per_trade_label = ttk.Label(self.result_frame, text="Risk Per Trade: ")
+        self.risk_per_trade_label.pack(pady=5)
+        self.max_loss_per_share_label = ttk.Label(self.result_frame, text="Max Loss Per Share: ")
+        self.max_loss_per_share_label.pack(pady=5)
+        self.atr_label = ttk.Label(self.result_frame, text="ATR: N/A")
+        self.atr_label.pack(pady=5)
+
+        # Historical Data Chart
+        self.chart_frame = ttk.Frame(main_frame)
+        self.chart_frame.pack(pady=10, fill="both", expand=True)
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot([], [])
+        canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
+        canvas_widget = canvas.get_tk_widget()
+        canvas_widget.pack(fill="both", expand=True)
+        toolbar = NavigationToolbar2Tk(canvas, self.chart_frame)
+        toolbar.update()
+        canvas_widget.pack(fill="both", expand=True)
+        self.fig = fig
+        self.ax = ax
+        self.canvas = canvas
+
+        # Start real-time price update
+        threading.Thread(target=self.update_real_time_price, daemon=True).start()
+
+    def fetch_price(self):
+        symbol = self.symbol_entry.get().upper()
+        if not symbol:
+            messagebox.showwarning("Input Error", "Please enter a symbol.")
+            return
+        current_price = fetch_real_time_price(symbol)
+        if current_price is not None:
+            self.entry_price_entry.delete(0, tk.END)
+            self.entry_price_entry.insert(0, f"{current_price:.2f}")
+        else:
+            messagebox.showerror("Error", f"Failed to fetch real-time price for {symbol}.")
+
+    def update_real_time_price(self):
+        while True:
+            symbol = self.symbol_entry.get().upper()
+            if symbol:
+                current_price = fetch_real_time_price(symbol)
+                if current_price is not None:
+                    self.entry_price_entry.delete(0, tk.END)
+                    self.entry_price_entry.insert(0, f"{current_price:.2f}")
+            time.sleep(10)  # Update every 10 seconds
+
+    def update_risk_percentage(self, value):
+        self.risk_percentage = float(value)
+        self.risk_label.config(text=f"{self.risk_percentage}%")
+
+    def calculate_position(self):
+        symbol = self.symbol_entry.get().upper()
+        stop_loss_type = self.stop_loss_type.get()
+        stop_loss_value_str = self.stop_loss_value_entry.get()
+        take_profit_str = self.take_profit_entry.get()
+        entry_price_str = self.entry_price_entry.get()
+        atr_timeframe = self.atr_timeframe.get()  # Get selected ATR timeframe
+
+        if not symbol or not stop_loss_value_str or not take_profit_str or not entry_price_str:
+            messagebox.showwarning("Input Error", "Please fill in all fields.")
+            return
+
+        try:
+            stop_loss_value = float(stop_loss_value_str)
+            take_profit = float(take_profit_str)
+            entry_price = float(entry_price_str)
+        except ValueError:
+            messagebox.showwarning("Input Error", "Invalid numeric input.")
+            return
+
+        if stop_loss_type == "Percentage":
+            stop_loss = entry_price * (1 - stop_loss_value / 100)
+        elif stop_loss_type == "ATR":
+            try:
+                # Map timeframe to yfinance interval and period
+                interval_map = {
+                    "5m": ("5m", "5d"),
+                    "15m": ("15m", "15d"),
+                    "1h": ("1h", "30d"),
+                    "1d": ("1d", "6mo"),
+                    "1wk": ("1wk", "1y")
+                }
+                interval, period = interval_map[atr_timeframe]
+                data = yf.download(symbol, period=period, interval=interval)
+                atr = calculate_atr(data)
+                stop_loss = entry_price - atr * stop_loss_value
+                self.atr_label.config(text=f"ATR: {atr:.2f}")
+            except Exception as e:
+                logging.error(f"Error calculating ATR for {symbol}: {e}")
+                messagebox.showerror("Error", f"Error calculating ATR for {symbol}.")
+                return
+
+        position_size = calculate_position_size(self.account_balance, self.risk_percentage, stop_loss, entry_price)
+        risk_per_trade = self.account_balance * (self.risk_percentage / 100)
+        max_loss_per_share = abs(entry_price - stop_loss)
+
+        self.position_size_label.config(text=f"Position Size: {position_size} shares")
+        self.stop_loss_label.config(text=f"Stop Loss: ${stop_loss:.2f}")
+        self.risk_per_trade_label.config(text=f"Risk Per Trade: ${risk_per_trade:.2f}")
+        self.max_loss_per_share_label.config(text=f"Max Loss Per Share: ${max_loss_per_share:.2f}")
+
+        # Confirm Order
+        self.confirm_order(symbol, entry_price, stop_loss, take_profit, position_size)
+
+    def confirm_order(self, symbol, entry_price, stop_loss, take_profit, position_size):
+        message = (
+            f"Symbol: {symbol}\n"
+            f"Entry Price: ${entry_price:.2f}\n"
+            f"Stop Loss: ${stop_loss:.2f}\n"
+            f"Take Profit: ${take_profit:.2f}\n"
+            f"Position Size: {position_size} shares\n"
+            f"Risk Per Trade: ${self.account_balance * (self.risk_percentage / 100):.2f}\n"
+            f"Max Loss Per Share: ${abs(entry_price - stop_loss):.2f}"
+        )
+        response = messagebox.askyesno("Confirm Order", message)
+        if response:
+            self.save_position_to_portfolio(symbol, entry_price, stop_loss, take_profit, position_size)
+
+    def save_position_to_portfolio(self, symbol, entry_price, stop_loss, take_profit, quantity):
+        try:
+            cursor.execute("""
+                INSERT INTO portfolio (symbol, entry_price, stop_loss, take_profit, quantity, entry_date, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (symbol, entry_price, stop_loss, take_profit, quantity, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Open"))
+            conn.commit()
+            messagebox.showinfo("Success", "Position saved to portfolio.")
+            self.portfolio_tracker.refresh()
+            self.plot_historical_data(symbol)
+        except Exception as e:
+            logging.error(f"Error saving position to portfolio: {e}")
+            messagebox.showerror("Error", "Failed to save position to portfolio.")
+
+    def plot_historical_data(self, symbol):
+        try:
+            data = yf.download(symbol, period="6mo", interval="1d")
+            self.ax.clear()
+            self.ax.plot(data.index, data['Close'], label='Close Price', color='blue')
+
+            # Highlight entry date
+            cursor.execute("SELECT entry_date FROM portfolio WHERE symbol = ?", (symbol,))
+            entry_dates = [datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S") for row in cursor.fetchall() if row[0]]
+            for entry_date in entry_dates:
+                self.ax.axvline(x=entry_date, color='green', linestyle='--', label='Entry Date' if entry_dates.index(entry_date) == 0 else "")
+
+            # Highlight exit date
+            cursor.execute("SELECT exit_date FROM portfolio WHERE symbol = ?", (symbol,))
+            exit_dates = [datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S") for row in cursor.fetchall() if row[0]]
+            for exit_date in exit_dates:
+                self.ax.axvline(x=exit_date, color='red', linestyle='--', label='Exit Date' if exit_dates.index(exit_date) == 0 else "")
+
+            self.ax.set_xlabel("Date", fontsize=12)
+            self.ax.set_ylabel("Price ($)", fontsize=12)
+            self.ax.set_title(f"Historical Price Data for {symbol}", fontsize=14)
+            self.ax.legend()
+            self.ax.grid(True)
+            self.canvas.draw()
+        except Exception as e:
+            logging.error(f"Error fetching historical data for {symbol}: {e}")
+            messagebox.showerror("Error", f"Failed to fetch historical data for {symbol}.")
+
+# Portfolio Tracker Tab
+class PortfolioTrackerTab(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        # Styling
+        style = ttk.Style()
+        style.configure('Treeview', font=('Helvetica', 12))
+        style.configure('Treeview.Heading', font=('Helvetica', 12, 'bold'))
+
+        # Table view
+        columns = ("ID", "Symbol", "Entry Price", "Stop Loss", "Take Profit", "Quantity", "PNL", "Status")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=10)
+        self.tree.column("ID", width=50, anchor="center")  # Hidden ID column
+        self.tree.heading("ID", text="ID")
+        for col in columns[1:]:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=120, anchor="center")
+        self.tree.grid(row=0, column=0, columnspan=3, padx=10, pady=10)
+
+        # Buttons
+        self.close_position_button = ttk.Button(self, text="Close Position", command=self.close_position)
+        self.close_position_button.grid(row=1, column=0, pady=10)
+        self.partial_close_button = ttk.Button(self, text="Partial Close", command=self.partial_close)
+        self.partial_close_button.grid(row=1, column=1, pady=10)
+
+        self.load_portfolio()
+
+    def load_portfolio(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        cursor.execute("SELECT id, symbol, entry_price, stop_loss, take_profit, quantity, pnl, status FROM portfolio WHERE status='Open'")
+        rows = cursor.fetchall()
+        for row in rows:
+            self.tree.insert("", tk.END, values=row, iid=str(row[0]))  # Use ID as iid
+
+    def close_position(self):
+        selected_item = self.tree.selection()
+        if not selected_item:
+            messagebox.showwarning("Selection Error", "Please select a position to close.")
+            return
+
+        position_id = selected_item[0]  # Get the hidden ID
+        item = self.tree.item(selected_item)
+        values = item["values"]
+        symbol = values[1]
+        quantity = int(values[5])
+        entry_price = float(values[2])
+
+        # Ask for the quantity to close
+        quantity_to_close_str = simpledialog.askstring("Close Position", f"How many shares of {symbol} would you like to close? (Max: {quantity})")
+        if not quantity_to_close_str:
+            return
+
+        try:
+            quantity_to_close = int(quantity_to_close_str)
+            if quantity_to_close <= 0 or quantity_to_close > quantity:
+                raise ValueError("Invalid quantity to close.")
+        except ValueError:
+            messagebox.showwarning("Input Error", "Invalid numeric input for quantity to close.")
+            return
+
+        exit_price = fetch_real_time_price(symbol)
+        if exit_price is None:
+            messagebox.showerror("Error", f"Failed to fetch real-time price for {symbol}.")
+            return
+
+        pnl = (exit_price - entry_price) * quantity_to_close
+        try:
+            if quantity_to_close == quantity:
+                cursor.execute("""
+                    UPDATE portfolio
+                    SET exit_date = ?, pnl = ?, status = 'Closed'
+                    WHERE id = ?
+                """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pnl, position_id))
+            else:
+                cursor.execute("""
+                    INSERT INTO portfolio (symbol, entry_price, stop_loss, take_profit, quantity, entry_date, exit_date, pnl, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (symbol, entry_price, values[3], values[4], quantity_to_close, values[6], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pnl, "Closed"))
+                cursor.execute("""
+                    UPDATE portfolio
+                    SET quantity = ?
+                    WHERE id = ?
+                """, (quantity - quantity_to_close, position_id))
+            conn.commit()
+            self.refresh()
+            messagebox.showinfo("Success", f"Position {symbol} closed for {quantity_to_close} shares.")
+        except Exception as e:
+            logging.error(f"Error closing position {symbol}: {e}")
+            messagebox.showerror("Error", f"Failed to close position {symbol}.")
+
+    def partial_close(self):
+        selected_item = self.tree.selection()
+        if not selected_item:
+            messagebox.showwarning("Selection Error", "Please select a position to partially close.")
+            return
+
+        position_id = selected_item[0]  # Get the hidden ID
+        item = self.tree.item(selected_item)
+        values = item["values"]
+        symbol = values[1]
+        quantity = int(values[5])
+        entry_price = float(values[2])
+
+        # Ask for the quantity to partially close
+        partial_quantity_str = simpledialog.askstring("Partial Close", f"How many shares of {symbol} would you like to partially close? (Max: {quantity})")
+        if not partial_quantity_str:
+            return
+
+        try:
+            partial_quantity = int(partial_quantity_str)
+            if partial_quantity <= 0 or partial_quantity > quantity:
+                raise ValueError("Invalid quantity to partially close.")
+        except ValueError:
+            messagebox.showwarning("Input Error", "Invalid numeric input for quantity to partially close.")
+            return
+
+        exit_price = fetch_real_time_price(symbol)
+        if exit_price is None:
+            messagebox.showerror("Error", f"Failed to fetch real-time price for {symbol}.")
+            return
+
+        pnl = (exit_price - entry_price) * partial_quantity
+        try:
+            cursor.execute("""
+                INSERT INTO portfolio (symbol, entry_price, stop_loss, take_profit, quantity, entry_date, exit_date, pnl, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (symbol, entry_price, values[3], values[4], partial_quantity, values[6], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pnl, "Closed"))
+            cursor.execute("""
+                UPDATE portfolio
+                SET quantity = ?
+                WHERE id = ?
+            """, (quantity - partial_quantity, position_id))
+            conn.commit()
+            self.refresh()
+            messagebox.showinfo("Success", f"Position {symbol} partially closed for {partial_quantity} shares.")
+        except Exception as e:
+            logging.error(f"Error partially closing position {symbol}: {e}")
+            messagebox.showerror("Error", f"Failed to partially close position {symbol}.")
+
+    def refresh(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        self.load_portfolio()
+
+# Closed Trades Tab
+class ClosedTradesTab(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        # Styling
+        style = ttk.Style()
+        style.configure('Treeview', font=('Helvetica', 12))
+        style.configure('Treeview.Heading', font=('Helvetica', 12, 'bold'))
+
+        # Table view
+        columns = ("Symbol", "Entry Price", "Stop Loss", "Take Profit", "Quantity", "PNL", "Entry Date", "Exit Date", "Status")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=10)
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=120, anchor="center")
+        self.tree.grid(row=0, column=0, columnspan=3, padx=10, pady=10)
+
+        self.load_closed_trades()
+
+    def load_closed_trades(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        cursor.execute("SELECT symbol, entry_price, stop_loss, take_profit, quantity, pnl, entry_date, exit_date, status FROM portfolio WHERE status='Closed'")
+        rows = cursor.fetchall()
+        for row in rows:
+            self.tree.insert("", tk.END, values=row)
+
+    def refresh(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        self.load_closed_trades()
+
+# Trading Statistics Tab
+class TradingStatisticsTab(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        self.stats = {
+            "Total Trades": 0,
+            "Win Rate": 0,
+            "Profit Factor": 0,
+            "Expectancy": 0,
+            "Avg Win": 0,
+            "Avg Loss": 0,
+            "Win/Loss Ratio": 0,
+            "Max Drawdown": 0,
+            "Risk/Reward": 0,
+            "Largest Win": 0,
+            "Largest Loss": 0,
+            "Avg Hold (Win)": 0,
+            "Avg Hold (Loss)": 0,
+        }
+        self.labels = {}  # Dictionary to store label references
+
+        # Styling
+        style = ttk.Style()
+        style.configure('TLabel', font=('Helvetica', 12))
+        style.configure('TFrame', borderwidth=2, relief="groove")
+
+        # Statistics Frame
+        stats_frame = ttk.Frame(self)
+        stats_frame.pack(pady=10, fill="both", expand=True)
+        for i, (key, value) in enumerate(self.stats.items()):
+            label = ttk.Label(stats_frame, text=f"{key}: {value}")
+            label.pack(pady=5)
+            self.labels[key] = label  # Store reference for updating
+
+        # Balance history chart
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot([], [])
+        canvas = FigureCanvasTkAgg(fig, master=self)
+        canvas_widget = canvas.get_tk_widget()
+        canvas_widget.pack(pady=10, fill="both", expand=True)
+        self.fig = fig
+        self.ax = ax
+        self.canvas = canvas
+
+        self.update_statistics()
+
+    def update_statistics(self):
+        cursor.execute("SELECT pnl, status, entry_date, exit_date FROM portfolio")
+        trades = cursor.fetchall()
+
+        # Filter out None values from pnl
+        trades = [(pnl, status, entry_date, exit_date) for pnl, status, entry_date, exit_date in trades if pnl is not None]
+
+        total_trades = len(trades)
+        wins = [t[0] for t in trades if t[0] > 0 and t[1] == "Closed"]
+        losses = [t[0] for t in trades if t[0] < 0 and t[1] == "Closed"]
+
+        win_rate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
+        profit_factor = sum(wins) / abs(sum(losses)) if sum(losses) != 0 and total_trades > 0 else float('inf')
+        expectancy = (sum(wins) + sum(losses)) / total_trades if total_trades > 0 else 0
+        avg_win = sum(wins) / len(wins) if len(wins) > 0 else 0
+        avg_loss = sum(losses) / len(losses) if len(losses) > 0 else 0
+        win_loss_ratio = avg_win / abs(avg_loss) if avg_loss != 0 and len(losses) > 0 else 0
+        cumulative_pnl = [sum(t[0] for t in trades[:i+1]) for i in range(len(trades))] if trades else [0]
+        max_drawdown = min(cumulative_pnl) if cumulative_pnl else 0
+        risk_reward = avg_win / abs(avg_loss) if avg_loss != 0 and len(losses) > 0 else 0
+        largest_win = max(wins) if wins else 0
+        largest_loss = min(losses) if losses else 0
+        avg_hold_win = np.mean([(pd.to_datetime(t[3]) - pd.to_datetime(t[2])).days for t in trades if t[0] > 0 and t[2] is not None and t[3] is not None]) if wins else 0
+        avg_hold_loss = np.mean([(pd.to_datetime(t[3]) - pd.to_datetime(t[2])).days for t in trades if t[0] < 0 and t[2] is not None and t[3] is not None]) if losses else 0
+
+        self.stats.update({
+            "Total Trades": total_trades,
+            "Win Rate": f"{win_rate:.1f}%" if total_trades > 0 else "N/A",
+            "Profit Factor": f"{profit_factor:.2f}" if profit_factor != float('inf') else "∞",
+            "Expectancy": f"${expectancy:.2f}",
+            "Avg Win": f"${avg_win:.2f}",
+            "Avg Loss": f"${avg_loss:.2f}",
+            "Win/Loss Ratio": f"{win_loss_ratio:.2f}:1" if win_loss_ratio != 0 else "N/A",
+            "Max Drawdown": f"{max_drawdown*100:.1f}%" if max_drawdown != 0 else "N/A",
+            "Risk/Reward": f"{risk_reward:.2f}:1" if risk_reward != 0 else "N/A",
+            "Largest Win": f"${largest_win:.2f}",
+            "Largest Loss": f"${largest_loss:.2f}",
+            "Avg Hold (Win)": f"{avg_hold_win:.1f} days" if avg_hold_win != 0 else "N/A",
+            "Avg Hold (Loss)": f"{avg_hold_loss:.1f} days" if avg_hold_loss != 0 else "N/A",
+        })
+
+        # Update labels
+        for key, value in self.stats.items():
+            self.labels[key].config(text=f"{key}: {value}")
+
+        # Update chart
+        self.ax.clear()
+        if trades:
+            dates = [pd.to_datetime(t[3]) for t in trades if t[1] == "Closed"]
+            pnls = [t[0] for t in trades if t[1] == "Closed"]
+            self.ax.plot(dates, pnls, marker='o', linestyle='-')
+            self.ax.fill_between(dates, pnls, color='skyblue', alpha=0.3)
+            self.ax.set_xlabel("Date", fontsize=12)
+            self.ax.set_ylabel("PnL ($)", fontsize=12)
+            self.ax.set_title("Balance History", fontsize=14)
+            self.ax.grid(True)
+            self.canvas.draw()
+
+    def refresh(self):
+        self.update_statistics()
+
+# Main Application
+class TradingApp(ThemedTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Trading Application")
+        self.geometry("1200x800")
+        self.set_theme("arc")  # Modern theme
+
+        # Initial Cash Balance
+        self.initial_cash_balance = tk.DoubleVar(value=10000)
+        self.risk_percentage = 2
+
+        # Styling
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('.', font=('Helvetica', 12))
+
+        # Menu Bar
+        self.menu_bar = tk.Menu(self)
+        self.config(menu=self.menu_bar)
+
+        # File Menu
+        self.file_menu = tk.Menu(self.menu_bar, tearoff=0)
+        self.file_menu.add_command(label="New Portfolio", command=self.new_portfolio)
+        self.file_menu.add_command(label="Open Portfolio", command=self.open_portfolio)
+        self.file_menu.add_command(label="Save Portfolio", command=self.save_portfolio)
+        self.file_menu.add_command(label="Save Portfolio As...", command=self.save_portfolio_as)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Exit", command=self.quit)
+        self.menu_bar.add_cascade(label="File", menu=self.file_menu)
+
+        # Help Menu
+        self.help_menu = tk.Menu(self.menu_bar, tearoff=0)
+        self.help_menu.add_command(label="About", command=self.show_about)
+        self.menu_bar.add_cascade(label="Help", menu=self.help_menu)
+
+        # Initial Cash Balance Entry
+        balance_frame = ttk.Frame(self)
+        balance_frame.pack(pady=10)
+        ttk.Label(balance_frame, text="Initial Cash Balance:").grid(row=0, column=0, padx=10, pady=10, sticky="e")
+        self.balance_entry = ttk.Entry(balance_frame, textvariable=self.initial_cash_balance)
+        self.balance_entry.grid(row=0, column=1, padx=10, pady=10, sticky="w")
+        ttk.Button(balance_frame, text="Set Balance", command=self.set_initial_balance).grid(row=0, column=2, padx=10, pady=10)
+
+        # Tabs
+        tab_control = ttk.Notebook(self)
+        self.portfolio_tracker = PortfolioTrackerTab(tab_control)
+        self.position_calculator = PositionCalculatorTab(
+            tab_control,
+            account_balance=self.initial_cash_balance.get(),
+            risk_percentage=self.risk_percentage,
+            portfolio_tracker=self.portfolio_tracker
+        )
+        self.trading_statistics = TradingStatisticsTab(tab_control)
+        self.closed_trades = ClosedTradesTab(tab_control)
+        tab_control.add(self.position_calculator, text="Position Calculator")
+        tab_control.add(self.portfolio_tracker, text="Portfolio Tracker")
+        tab_control.add(self.trading_statistics, text="Trading Statistics")
+        tab_control.add(self.closed_trades, text="Closed Trades")
+        tab_control.pack(expand=1, fill="both")
+
+        # Start periodic refresh
+        self.periodic_refresh()
+
+    def set_initial_balance(self):
+        try:
+            balance = float(self.balance_entry.get())
+            self.initial_cash_balance.set(balance)
+            self.position_calculator.account_balance = balance
+            messagebox.showinfo("Success", f"Initial cash balance set to ${balance:.2f}.")
+        except ValueError:
+            messagebox.showwarning("Input Error", "Invalid numeric input for initial cash balance.")
+
+    def periodic_refresh(self):
+        try:
+            self.portfolio_tracker.refresh()
+            self.trading_statistics.refresh()
+            self.closed_trades.refresh()
+        except Exception as e:
+            logging.error(f"Error during periodic refresh: {e}")
+        self.after(10000, self.periodic_refresh)
+
+    def new_portfolio(self):
+        """Create a new portfolio."""
+        response = messagebox.askyesno("New Portfolio", "Are you sure you want to create a new portfolio? All unsaved data will be lost.")
+        if response:
+            cursor.execute("DELETE FROM portfolio")
+            conn.commit()
+            self.portfolio_tracker.refresh()
+            self.trading_statistics.refresh()
+            self.closed_trades.refresh()
+            messagebox.showinfo("Success", "New portfolio created.")
+
+    def open_portfolio(self):
+        """Open an existing portfolio."""
+        file_path = filedialog.askopenfilename(
+            title="Open Portfolio",
+            filetypes=[("SQLite Database", "*.db"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+        try:
+            global conn, cursor
+            conn.close()  # Close the current connection
+            conn = sqlite3.connect(file_path, check_same_thread=False)
+            cursor = conn.cursor()
+            # Verify that the database has the required table
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='portfolio'")
+            if not cursor.fetchone():
+                raise ValueError("Invalid portfolio file.")
+            self.portfolio_tracker.refresh()
+            self.trading_statistics.refresh()
+            self.closed_trades.refresh()
+            messagebox.showinfo("Success", f"Portfolio opened from {file_path}.")
+        except Exception as e:
+            logging.error(f"Error opening portfolio: {e}")
+            messagebox.showerror("Error", "Failed to open portfolio.")
+
+    def save_portfolio(self):
+        """Save the current portfolio."""
+        file_path = "trading_app.db"  # Default file path
+        try:
+            conn.commit()
+            messagebox.showinfo("Success", f"Portfolio saved to {file_path}.")
+        except Exception as e:
+            logging.error(f"Error saving portfolio: {e}")
+            messagebox.showerror("Error", "Failed to save portfolio.")
+
+    def save_portfolio_as(self):
+        """Save the current portfolio with a new name."""
+        file_path = filedialog.asksaveasfilename(
+            title="Save Portfolio As",
+            defaultextension=".db",
+            filetypes=[("SQLite Database", "*.db"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+        try:
+            global conn, cursor
+            conn.close()  # Close the current connection
+            conn = sqlite3.connect(file_path, check_same_thread=False)
+            cursor = conn.cursor()
+            # Ensure the 'portfolio' table exists
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS portfolio (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT,
+                    entry_price REAL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    quantity INTEGER,
+                    entry_date TEXT,
+                    exit_date TEXT,
+                    pnl REAL,
+                    status TEXT
+                )
+            ''')
+
+            # Ensure the 'portfolio' table exists
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS portfolio (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT,
+                    entry_price REAL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    quantity INTEGER,
+                    entry_date TEXT,
+                    exit_date TEXT,
+                    pnl REAL,
+                    status TEXT
+                )
+            ''')
+            conn.commit()
+
+            messagebox.showinfo("Success", f"Portfolio saved as {file_path}.")
+        except Exception as e:
+            logging.error(f"Error saving portfolio as: {e}")
+            messagebox.showerror("Error", "Failed to save portfolio.")
+
+    def show_about(self):
+        """Show information about the application."""
+        messagebox.showinfo(
+            "About",
+            "Trading Application\nVersion 1.0\nDeveloped by [Your Name]\n© 2023"
+        )
+
+if __name__ == "__main__":
+    app = TradingApp()
+    app.mainloop()
