@@ -6,789 +6,1293 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
 import threading
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from ttkthemes import ThemedTk
+import csv
+from pathlib import Path
+import json
+import requests
+from decimal import Decimal
 
-# Database setup
-conn = sqlite3.connect('trading_app.db', check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS portfolio (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT,
-        entry_price REAL,
-        stop_loss REAL,
-        take_profit REAL,
-        quantity INTEGER,
-        entry_date TEXT,
-        exit_date TEXT,
-        pnl REAL,
-        status TEXT
-    )
-''')
-conn.commit()
+# Konfiguracija logginga
+logging.basicConfig(
+    filename='trading_app.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
-# Logging setup
-logging.basicConfig(filename='trading_app.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Helper Functions
-def fetch_real_time_price(symbol):
-    """Fetch real-time price for a stock."""
-    try:
-        ticker = yf.Ticker(symbol)
-        data = ticker.history(period='1d')
-        if data.empty:
+class DatabaseManager:
+    def __init__(self, db_path='trading_app.db'):
+        self.db_path = db_path
+        self.conn = None
+        self.cursor = None
+        self.connect()
+        self.setup_database()
+
+    def connect(self):
+        try:
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.cursor = self.conn.cursor()
+        except Exception as e:
+            logger.error(f"Database connection error: {e}")
+            raise
+
+    def setup_database(self):
+        try:
+            # Main portfolio table
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS portfolio (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_price REAL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    quantity INTEGER NOT NULL,
+                    entry_date TEXT NOT NULL,
+                    exit_date TEXT,
+                    pnl REAL,
+                    trade_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    notes TEXT
+                )
+            ''')
+
+            # Trading statistics table
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trading_statistics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    total_trades INTEGER,
+                    winning_trades INTEGER,
+                    losing_trades INTEGER,
+                    win_rate REAL,
+                    profit_factor REAL,
+                    average_win REAL,
+                    average_loss REAL,
+                    largest_win REAL,
+                    largest_loss REAL,
+                    total_pnl REAL
+                )
+            ''')
+
+            # Trade journal table
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trade_journal (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id INTEGER,
+                    entry_date TEXT NOT NULL,
+                    notes TEXT,
+                    strategy TEXT,
+                    market_conditions TEXT,
+                    FOREIGN KEY (trade_id) REFERENCES portfolio (id)
+                )
+            ''')
+
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Database setup error: {e}")
+            raise
+
+    def execute_query(self, query, parameters=None):
+        try:
+            if parameters:
+                self.cursor.execute(query, parameters)
+            else:
+                self.cursor.execute(query)
+            self.conn.commit()
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Query execution error: {query} - {e}")
+            self.conn.rollback()
+            raise
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+class MarketDataManager:
+    def __init__(self):
+        self.cache = {}
+        self.cache_timeout = 60  # sekunde
+
+    def get_real_time_price(self, symbol):
+        try:
+            current_time = time.time()
+            if symbol in self.cache:
+                cached_data = self.cache[symbol]
+                if current_time - cached_data['timestamp'] < self.cache_timeout:
+                    return cached_data['price']
+
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(period='1d')
+            if data.empty:
+                return None
+            
+            price = float(data['Close'].iloc[-1])
+            self.cache[symbol] = {
+                'price': price,
+                'timestamp': current_time
+            }
+            return price
+        except Exception as e:
+            logger.error(f"Error fetching price for {symbol}: {e}")
             return None
-        return data['Close'].iloc[-1]
-    except Exception as e:
-        logging.error(f"Error fetching price for {symbol}: {e}")
-        return None
 
-def calculate_atr(data, period=14):
-    """Calculate ATR (Average True Range)."""
-    if data.empty:
-        return None
-    high_low = data['High'] - data['Low']
-    high_close = np.abs(data['High'] - data['Close'].shift())
-    low_close = np.abs(data['Low'] - data['Close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = np.max(ranges, axis=1)
-    atr = true_range.rolling(window=period).mean()
-    return atr.iloc[-1]
+    def get_historical_data(self, symbol, period='1y', interval='1d'):
+        try:
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(period=period, interval=interval)
+            return data
+        except Exception as e:
+            logger.error(f"Error fetching historical data for {symbol}: {e}")
+            return pd.DataFrame()
 
-def calculate_position_size(account_balance, risk_percentage, stop_loss, current_price):
-    """Calculate position size based on risk management."""
-    risk_per_trade = account_balance * (risk_percentage / 100)
-    risk_per_share = abs(current_price - stop_loss)
-    if risk_per_share == 0:
-        return 0
-    return int(risk_per_trade / risk_per_share)
+    def calculate_atr(self, symbol, period=14):
+        try:
+            data = self.get_historical_data(symbol, period='1mo', interval='1d')
+            if data.empty:
+                return None
+                
+            # Izračun True Range
+            data['H-L'] = data['High'] - data['Low']
+            data['H-PC'] = abs(data['High'] - data['Close'].shift(1))
+            data['L-PC'] = abs(data['Low'] - data['Close'].shift(1))
+            
+            data['TR'] = data[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+            data['ATR'] = data['TR'].rolling(window=period).mean()
+            
+            return data['ATR'].iloc[-1]
+        except Exception as e:
+            logger.error(f"Error calculating ATR for {symbol}: {e}")
+            return None
 
-# Position Calculator Tab
-class PositionCalculatorTab(ttk.Frame):
-    def __init__(self, parent, account_balance, risk_percentage, portfolio_tracker):
+class RiskManagement:
+    def __init__(self, account_balance, max_risk_per_trade=0.02):
+        self.account_balance = account_balance
+        self.max_risk_per_trade = max_risk_per_trade
+
+    def calculate_position_size(self, entry_price, stop_loss):
+        try:
+            risk_amount = self.account_balance * self.max_risk_per_trade
+            risk_per_share = abs(entry_price - stop_loss)
+            if risk_per_share == 0:
+                return 0
+            position_size = int(risk_amount / risk_per_share)
+            return position_size
+        except Exception as e:
+            logger.error(f"Error calculating position size: {e}")
+            return 0
+
+    def calculate_risk_metrics(self, position_size, entry_price, stop_loss, take_profit):
+        try:
+            risk_per_share = abs(entry_price - stop_loss)
+            reward_per_share = abs(take_profit - entry_price)
+            total_risk = risk_per_share * position_size
+            total_reward = reward_per_share * position_size
+            risk_reward_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0
+            
+            return {
+                'risk_per_share': risk_per_share,
+                'reward_per_share': reward_per_share,
+                'total_risk': total_risk,
+                'total_reward': total_reward,
+                'risk_reward_ratio': risk_reward_ratio,
+                'risk_percentage': (total_risk / self.account_balance) * 100
+            }
+        except Exception as e:
+            logger.error(f"Error calculating risk metrics: {e}")
+            return None
+
+    def validate_trade(self, entry_price, stop_loss, take_profit):
+        """
+        Validacija trgovine prema rizik/reward kriterijima
+        """
+        try:
+            risk = abs(entry_price - stop_loss)
+            reward = abs(take_profit - entry_price)
+            
+            # Minimalni rizik/reward ratio 1:2
+            if reward / risk < 2:
+                return False, "Risk/Reward ratio should be at least 1:2"
+            
+            # Maksimalni rizik po trgovini
+            max_risk = self.account_balance * self.max_risk_per_trade
+            if risk > max_risk:
+                return False, f"Risk exceeds maximum allowed risk of ${max_risk:.2f}"
+            
+            return True, "Trade validation successful"
+        except Exception as e:
+            logger.error(f"Error validating trade: {e}")
+            return False, f"Error validating trade: {str(e)}"
+class PortfolioTracker(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.market_data = MarketDataManager()
+        self.setup_ui()
+        self.start_auto_refresh()
+
+    def setup_ui(self):
+        # Glavni okvir za treeview
+        columns = ("ID", "Symbol", "Entry Price", "Current Price", "Stop Loss", 
+                  "Take Profit", "Quantity", "PnL", "PnL %", "Status")
+        
+        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=10)
+        
+        # Konfiguracija stupaca
+        self.tree.column("ID", width=50, anchor="center")
+        for col in columns[1:]:
+            self.tree.heading(col, text=col)
+            width = 100 if col not in ["Symbol", "Status"] else 80
+            self.tree.column(col, width=width, anchor="center")
+        
+        # Sakrivanje ID stupca
+        self.tree.column("#1", stretch=False, width=0)
+        
+        # Scrollbars
+        y_scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        x_scroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        
+        # Pakiranje elemenata
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Frame za gumbe
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Gumbi
+        ttk.Button(btn_frame, text="Close Position", 
+                  command=self.close_position).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Modify Position", 
+                  command=self.modify_position).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Add Note", 
+                  command=self.add_note).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Export Data", 
+                  command=self.export_data).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Refresh", 
+                  command=self.refresh).pack(side=tk.LEFT, padx=5)
+
+    def load_positions(self):
+        db = DatabaseManager()
+        try:
+            positions = db.execute_query('''
+                SELECT id, symbol, entry_price, stop_loss, take_profit, quantity, 
+                       pnl, status FROM portfolio WHERE status = 'Open'
+            ''')
+            
+            for position in positions:
+                position_id, symbol, entry_price = position[0:3]
+                current_price = self.market_data.get_real_time_price(symbol)
+                
+                if current_price:
+                    quantity = position[5]
+                    pnl = (current_price - entry_price) * quantity
+                    pnl_percentage = (pnl / (entry_price * quantity)) * 100
+                    
+                    values = list(position)
+                    values.insert(3, current_price)  # Dodaj trenutnu cijenu
+                    values[6] = f"${pnl:.2f}"       # Formatiraj PnL
+                    values.insert(7, f"{pnl_percentage:.2f}%")  # Dodaj PnL postotak
+                    
+                    # Dodaj boju ovisno o PnL
+                    tag = 'profit' if pnl > 0 else 'loss'
+                    self.tree.insert("", tk.END, values=values, tags=(tag,))
+                    
+            # Konfiguriraj boje za PnL
+            self.tree.tag_configure('profit', foreground='green')
+            self.tree.tag_configure('loss', foreground='red')
+            
+        except Exception as e:
+            logger.error(f"Error loading positions: {e}")
+            messagebox.showerror("Error", f"Failed to load positions: {str(e)}")
+        finally:
+            db.close()
+
+    def close_position(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Selection Error", "Please select a position to close.")
+            return
+
+        position = self.tree.item(selected[0])['values']
+        position_id = position[0]
+        symbol = position[1]
+        current_price = self.market_data.get_real_time_price(symbol)
+        
+        if current_price:
+            if messagebox.askyesno("Confirm Close",
+                                 f"Close position {symbol} at ${current_price:.2f}?"):
+                self.execute_close_position(position_id, current_price)
+
+    def execute_close_position(self, position_id, exit_price):
+        db = DatabaseManager()
+        try:
+            # Dohvati podatke o poziciji
+            position = db.execute_query('''
+                SELECT entry_price, quantity FROM portfolio WHERE id = ?
+            ''', (position_id,))[0]
+            
+            entry_price, quantity = position
+            pnl = (exit_price - entry_price) * quantity
+            
+            # Ažuriraj poziciju
+            db.execute_query('''
+                UPDATE portfolio
+                SET exit_price = ?, exit_date = ?, pnl = ?, status = 'Closed'
+                WHERE id = ?
+            ''', (exit_price, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                 pnl, position_id))
+            
+            self.refresh()
+            messagebox.showinfo("Success", f"Position closed with PnL: ${pnl:.2f}")
+            
+            # Ažuriraj statistiku i zatvorene trgovine
+            if hasattr(self.master, 'statistics'):
+                self.master.statistics.calculate_statistics()
+            if hasattr(self.master, 'closed_trades'):
+                self.master.closed_trades.load_closed_trades()
+            
+        except Exception as e:
+            logger.error(f"Error closing position: {e}")
+            messagebox.showerror("Error", "Failed to close position.")
+        finally:
+            db.close()
+
+    def modify_position(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Selection Error", "Please select a position to modify.")
+            return
+
+        position = self.tree.item(selected[0])['values']
+        position_id = position[0]
+        
+        modify_window = tk.Toplevel(self)
+        modify_window.title("Modify Position")
+        modify_window.geometry("300x200")
+        
+        ttk.Label(modify_window, text="Stop Loss:").pack(pady=5)
+        stop_loss_entry = ttk.Entry(modify_window)
+        stop_loss_entry.insert(0, str(position[4]))
+        stop_loss_entry.pack(pady=5)
+        
+        ttk.Label(modify_window, text="Take Profit:").pack(pady=5)
+        take_profit_entry = ttk.Entry(modify_window)
+        take_profit_entry.insert(0, str(position[5]))
+        take_profit_entry.pack(pady=5)
+        
+        def save_modifications():
+            try:
+                db = DatabaseManager()
+                db.execute_query('''
+                    UPDATE portfolio
+                    SET stop_loss = ?, take_profit = ?
+                    WHERE id = ?
+                ''', (float(stop_loss_entry.get()), 
+                     float(take_profit_entry.get()), position_id))
+                modify_window.destroy()
+                self.refresh()
+                messagebox.showinfo("Success", "Position updated successfully!")
+            except Exception as e:
+                logger.error(f"Error modifying position: {e}")
+                messagebox.showerror("Error", "Failed to modify position.")
+            finally:
+                db.close()
+        
+        ttk.Button(modify_window, text="Save", 
+                  command=save_modifications).pack(pady=20)
+
+    def add_note(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Selection Error", 
+                                 "Please select a position to add a note.")
+            return
+
+        position_id = self.tree.item(selected[0])['values'][0]
+        note = simpledialog.askstring("Add Note", "Enter note:")
+        
+        if note:
+            db = DatabaseManager()
+            try:
+                db.execute_query('''
+                    INSERT INTO trade_journal (trade_id, entry_date, notes)
+                    VALUES (?, ?, ?)
+                ''', (position_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), note))
+                messagebox.showinfo("Success", "Note added successfully!")
+            except Exception as e:
+                logger.error(f"Error adding note: {e}")
+                messagebox.showerror("Error", "Failed to add note.")
+            finally:
+                db.close()
+
+    def export_data(self):
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), 
+                      ("Excel files", "*.xlsx"), 
+                      ("All files", "*.*")]
+        )
+        if not file_path:
+            return
+            
+        db = DatabaseManager()
+        try:
+            data = db.execute_query('''
+                SELECT * FROM portfolio
+                ORDER BY entry_date DESC
+            ''')
+            
+            df = pd.DataFrame(data, columns=[
+                'ID', 'Symbol', 'Entry Price', 'Exit Price', 'Stop Loss',
+                'Take Profit', 'Quantity', 'Entry Date', 'Exit Date', 'PnL',
+                'Trade Type', 'Status', 'Notes'
+            ])
+            
+            if file_path.endswith('.csv'):
+                df.to_csv(file_path, index=False)
+            else:
+                df.to_excel(file_path, index=False)
+                
+            messagebox.showinfo("Success", "Data exported successfully!")
+        except Exception as e:
+            logger.error(f"Error exporting data: {e}")
+            messagebox.showerror("Error", "Failed to export data.")
+        finally:
+            db.close()
+
+    def refresh(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.load_positions()
+
+    def start_auto_refresh(self):
+        self.refresh()
+        self.after(30000, self.start_auto_refresh)  # Osvježi svakih 30 sekundi
+class PositionCalculator(ttk.Frame):
+    def __init__(self, parent, account_balance=10000.0, risk_percentage=2.0, portfolio_tracker=None):
         super().__init__(parent)
         self.account_balance = account_balance
         self.risk_percentage = risk_percentage
         self.portfolio_tracker = portfolio_tracker
+        self.market_data = MarketDataManager()
+        self.risk_manager = RiskManagement(account_balance)
+        self.setup_ui()
 
-        # Styling
-        style = ttk.Style()
-        style.configure('TLabel', font=('Helvetica', 12))
-        style.configure('TButton', font=('Helvetica', 12))
-        style.configure('TEntry', font=('Helvetica', 12))
-        style.configure('TFrame', borderwidth=2, relief="groove")
+    def setup_ui(self):
+        # Okvir za unos simbola
+        symbol_frame = ttk.LabelFrame(self, text="Trade Entry", padding=10)
+        symbol_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        # Main Frame
-        main_frame = ttk.Frame(self)
-        main_frame.pack(padx=10, pady=10, fill="both", expand=True)
+        # Unos simbola
+        ttk.Label(symbol_frame, text="Symbol:").grid(row=0, column=0, padx=5, pady=5)
+        self.symbol_var = tk.StringVar()
+        self.symbol_entry = ttk.Entry(symbol_frame, textvariable=self.symbol_var)
+        self.symbol_entry.grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(symbol_frame, text="Fetch Price", 
+                  command=self.fetch_price).grid(row=0, column=2, padx=5, pady=5)
 
-        # Symbol Entry
-        symbol_frame = ttk.Frame(main_frame)
-        symbol_frame.pack(pady=5, fill="x")
-        ttk.Label(symbol_frame, text="Symbol:").pack(side="left", padx=10, pady=5)
-        self.symbol_entry = ttk.Entry(symbol_frame)
-        self.symbol_entry.pack(side="left", padx=10, pady=5, fill="x", expand=True)
-        self.fetch_price_button = ttk.Button(symbol_frame, text="Fetch Price", command=self.fetch_price)
-        self.fetch_price_button.pack(side="left", padx=10, pady=5)
+        # Unos cijena
+        self.setup_price_entries(symbol_frame)
 
-        # Entry Price Entry
-        entry_price_frame = ttk.Frame(main_frame)
-        entry_price_frame.pack(pady=5, fill="x")
-        ttk.Label(entry_price_frame, text="Entry Price:").pack(side="left", padx=10, pady=5)
-        self.entry_price_entry = ttk.Entry(entry_price_frame)
-        self.entry_price_entry.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+        # Odabir vrste trgovine
+        self.trade_type = tk.StringVar(value="Long")
+        ttk.Radiobutton(symbol_frame, text="Long", 
+                       variable=self.trade_type, 
+                       value="Long").grid(row=4, column=0)
+        ttk.Radiobutton(symbol_frame, text="Short", 
+                       variable=self.trade_type, 
+                       value="Short").grid(row=4, column=1)
 
-        # Stop Loss Type
-        stop_loss_type_frame = ttk.Frame(main_frame)
-        stop_loss_type_frame.pack(pady=5, fill="x")
-        ttk.Label(stop_loss_type_frame, text="Stop Loss Type:").pack(side="left", padx=10, pady=5)
-        self.stop_loss_type = tk.StringVar(value="Percentage")
-        ttk.Radiobutton(stop_loss_type_frame, text="Percentage", variable=self.stop_loss_type, value="Percentage").pack(side="left", padx=10, pady=5)
-        ttk.Radiobutton(stop_loss_type_frame, text="ATR", variable=self.stop_loss_type, value="ATR").pack(side="left", padx=10, pady=5)
+        # Okvir za upravljanje rizikom
+        risk_frame = ttk.LabelFrame(self, text="Risk Management", padding=10)
+        risk_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.setup_risk_settings(risk_frame)
 
-        # ATR Timeframe Selection
-        atr_timeframe_frame = ttk.Frame(main_frame)
-        atr_timeframe_frame.pack(pady=5, fill="x")
-        ttk.Label(atr_timeframe_frame, text="ATR Timeframe:").pack(side="left", padx=10, pady=5)
-        self.atr_timeframe = ttk.Combobox(atr_timeframe_frame, values=["5m", "15m", "1h", "1d", "1wk"], state="readonly")
-        self.atr_timeframe.set("1d")  # Default value
-        self.atr_timeframe.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+        # Okvir za rezultate
+        self.setup_results_frame()
 
-        # Stop Loss Value Entry
-        stop_loss_value_frame = ttk.Frame(main_frame)
-        stop_loss_value_frame.pack(pady=5, fill="x")
-        ttk.Label(stop_loss_value_frame, text="Stop Loss Value:").pack(side="left", padx=10, pady=5)
-        self.stop_loss_value_entry = ttk.Entry(stop_loss_value_frame)
-        self.stop_loss_value_entry.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+        # Okvir za grafikon
+        self.setup_chart_frame()
 
-        # Take Profit Entry
-        take_profit_frame = ttk.Frame(main_frame)
-        take_profit_frame.pack(pady=5, fill="x")
-        ttk.Label(take_profit_frame, text="Take Profit:").pack(side="left", padx=10, pady=5)
-        self.take_profit_entry = ttk.Entry(take_profit_frame)
-        self.take_profit_entry.pack(side="left", padx=10, pady=5, fill="x", expand=True)
+    def setup_price_entries(self, parent_frame):
+        # Ulazna cijena
+        self.entry_price_var = tk.StringVar()
+        ttk.Label(parent_frame, text="Entry Price:").grid(row=1, column=0, padx=5, pady=5)
+        self.entry_price_entry = ttk.Entry(parent_frame, textvariable=self.entry_price_var)
+        self.entry_price_entry.grid(row=1, column=1, padx=5, pady=5)
 
-        # Risk Percentage Slider
-        risk_frame = ttk.Frame(main_frame)
-        risk_frame.pack(pady=5, fill="x")
-        ttk.Label(risk_frame, text="Risk Percentage:").pack(side="left", padx=10, pady=5)
-        self.risk_slider = ttk.Scale(risk_frame, from_=0.1, to=10, orient="horizontal", length=300, command=self.update_risk_percentage)
+        # Stop Loss okvir
+        stop_loss_frame = ttk.LabelFrame(parent_frame, text="Stop Loss Settings", padding=5)
+        stop_loss_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
+
+        # Vrsta Stop Loss-a
+        self.stop_loss_type = tk.StringVar(value="Fixed")
+        ttk.Radiobutton(stop_loss_frame, text="Fixed", 
+                       variable=self.stop_loss_type, 
+                       value="Fixed",
+                       command=self.update_stop_loss_mode).grid(row=0, column=0)
+        ttk.Radiobutton(stop_loss_frame, text="ATR Based", 
+                       variable=self.stop_loss_type, 
+                       value="ATR",
+                       command=self.update_stop_loss_mode).grid(row=0, column=1)
+
+        # Fiksni Stop Loss
+        self.stop_loss_var = tk.StringVar()
+        self.stop_loss_label = ttk.Label(stop_loss_frame, text="Stop Loss:")
+        self.stop_loss_label.grid(row=1, column=0)
+        self.stop_loss_entry = ttk.Entry(stop_loss_frame, textvariable=self.stop_loss_var)
+        self.stop_loss_entry.grid(row=1, column=1)
+
+        # ATR množitelj
+        self.atr_multiplier_var = tk.StringVar(value="2.0")
+        self.atr_multiplier_label = ttk.Label(stop_loss_frame, text="ATR Multiplier:")
+        self.atr_multiplier_label.grid(row=2, column=0)
+        self.atr_multiplier_entry = ttk.Entry(stop_loss_frame, 
+                                           textvariable=self.atr_multiplier_var)
+        self.atr_multiplier_entry.grid(row=2, column=1)
+        
+        # ATR vrijednost
+        self.atr_value_label = ttk.Label(stop_loss_frame, text="Current ATR: N/A")
+        self.atr_value_label.grid(row=3, column=0, columnspan=2)
+
+        # Početno sakrij ATR kontrole
+        self.atr_multiplier_label.grid_remove()
+        self.atr_multiplier_entry.grid_remove()
+        self.atr_value_label.grid_remove()
+
+        # Take Profit
+        self.take_profit_var = tk.StringVar()
+        ttk.Label(parent_frame, text="Take Profit:").grid(row=3, column=0, padx=5, pady=5)
+        self.take_profit_entry = ttk.Entry(parent_frame, textvariable=self.take_profit_var)
+        self.take_profit_entry.grid(row=3, column=1, padx=5, pady=5)
+
+    def setup_risk_settings(self, risk_frame):
+        # Risk postotak slider
+        ttk.Label(risk_frame, text="Risk %:").grid(row=0, column=0, padx=5, pady=5)
+        self.risk_slider = ttk.Scale(risk_frame, from_=0.1, to=5.0, orient="horizontal")
         self.risk_slider.set(self.risk_percentage)
-        self.risk_slider.pack(side="left", padx=10, pady=5)
-        self.risk_label = ttk.Label(risk_frame, text=f"{self.risk_percentage}%")
-        self.risk_label.pack(side="left", padx=10, pady=5)
+        self.risk_slider.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        
+        # Gumb za izračun
+        ttk.Button(risk_frame, text="Calculate Position", 
+                  command=self.calculate_position).grid(row=1, column=0, columnspan=2, pady=10)
 
-        # Calculate Button
-        self.calculate_button = ttk.Button(main_frame, text="Calculate", command=self.calculate_position)
-        self.calculate_button.pack(pady=20)
+    def setup_results_frame(self):
+        results_frame = ttk.LabelFrame(self, text="Position Details", padding=10)
+        results_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        # Detailed Output
-        self.result_frame = ttk.Frame(main_frame)
-        self.result_frame.pack(pady=10, fill="both", expand=True)
-        ttk.Label(self.result_frame, text="Calculated Details:", font=('Helvetica', 14, 'bold')).pack(pady=10)
-        self.position_size_label = ttk.Label(self.result_frame, text="Position Size: ")
-        self.position_size_label.pack(pady=5)
-        self.stop_loss_label = ttk.Label(self.result_frame, text="Stop Loss: ")
-        self.stop_loss_label.pack(pady=5)
-        self.risk_per_trade_label = ttk.Label(self.result_frame, text="Risk Per Trade: ")
-        self.risk_per_trade_label.pack(pady=5)
-        self.max_loss_per_share_label = ttk.Label(self.result_frame, text="Max Loss Per Share: ")
-        self.max_loss_per_share_label.pack(pady=5)
-        self.atr_label = ttk.Label(self.result_frame, text="ATR: N/A")
-        self.atr_label.pack(pady=5)
+        self.position_size_label = ttk.Label(results_frame, text="Position Size: ")
+        self.position_size_label.pack(pady=2)
 
-        # Historical Data Chart
-        self.chart_frame = ttk.Frame(main_frame)
-        self.chart_frame.pack(pady=10, fill="both", expand=True)
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot([], [])
-        canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
-        canvas_widget = canvas.get_tk_widget()
-        canvas_widget.pack(fill="both", expand=True)
-        toolbar = NavigationToolbar2Tk(canvas, self.chart_frame)
-        toolbar.update()
-        canvas_widget.pack(fill="both", expand=True)
-        self.fig = fig
-        self.ax = ax
-        self.canvas = canvas
+        self.risk_amount_label = ttk.Label(results_frame, text="Risk Amount: ")
+        self.risk_amount_label.pack(pady=2)
 
-        # Start real-time price update
-        threading.Thread(target=self.update_real_time_price, daemon=True).start()
+        self.reward_amount_label = ttk.Label(results_frame, text="Potential Reward: ")
+        self.reward_amount_label.pack(pady=2)
+
+        self.risk_reward_label = ttk.Label(results_frame, text="Risk/Reward Ratio: ")
+        self.risk_reward_label.pack(pady=2)
+
+    def setup_chart_frame(self):
+        chart_frame = ttk.LabelFrame(self, text="Price Chart", padding=10)
+        chart_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.fig, self.ax = plt.subplots(figsize=(8, 4))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=chart_frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self.toolbar = NavigationToolbar2Tk(self.canvas, chart_frame)
+        self.toolbar.update()
+
+    def update_stop_loss_mode(self):
+        if self.stop_loss_type.get() == "ATR":
+            self.stop_loss_label.configure(text="ATR Stop Loss:")
+            self.atr_multiplier_label.grid()
+            self.atr_multiplier_entry.grid()
+            self.atr_value_label.grid()
+            if self.symbol_var.get():
+                self.calculate_atr_stop_loss()
+        else:
+            self.stop_loss_label.configure(text="Stop Loss:")
+            self.atr_multiplier_label.grid_remove()
+            self.atr_multiplier_entry.grid_remove()
+            self.atr_value_label.grid_remove()
+
+    def calculate_atr_stop_loss(self):
+        symbol = self.symbol_var.get().upper()
+        if not symbol:
+            return
+            
+        try:
+            atr = self.market_data.calculate_atr(symbol)
+            if atr is not None:
+                self.atr_value_label.configure(text=f"Current ATR: ${atr:.2f}")
+                
+                if self.stop_loss_type.get() == "ATR":
+                    current_price = float(self.entry_price_var.get())
+                    multiplier = float(self.atr_multiplier_var.get())
+                    
+                    if self.trade_type.get() == "Long":
+                        stop_loss = current_price - (atr * multiplier)
+                    else:
+                        stop_loss = current_price + (atr * multiplier)
+                        
+                    self.stop_loss_var.set(f"{stop_loss:.2f}")
+            else:
+                self.atr_value_label.configure(text="ATR: Not Available")
+        except Exception as e:
+            logger.error(f"Error calculating ATR stop loss: {e}")
+            messagebox.showerror("Error", "Failed to calculate ATR stop loss.")
 
     def fetch_price(self):
-        symbol = self.symbol_entry.get().upper()
+        symbol = self.symbol_var.get().upper()
         if not symbol:
             messagebox.showwarning("Input Error", "Please enter a symbol.")
             return
-        current_price = fetch_real_time_price(symbol)
+                
+        current_price = self.market_data.get_real_time_price(symbol)
         if current_price is not None:
-            self.entry_price_entry.delete(0, tk.END)
-            self.entry_price_entry.insert(0, f"{current_price:.2f}")
+            self.entry_price_var.set(f"{current_price:.2f}")
+            self.update_chart(symbol)
+            if self.stop_loss_type.get() == "ATR":
+                self.calculate_atr_stop_loss()
         else:
-            messagebox.showerror("Error", f"Failed to fetch real-time price for {symbol}.")
+            messagebox.showerror("Error", f"Failed to fetch price for {symbol}")
 
-    def update_real_time_price(self):
-        while True:
-            symbol = self.symbol_entry.get().upper()
-            if symbol:
-                current_price = fetch_real_time_price(symbol)
-                if current_price is not None:
-                    self.entry_price_entry.delete(0, tk.END)
-                    self.entry_price_entry.insert(0, f"{current_price:.2f}")
-            time.sleep(10)  # Update every 10 seconds
+    def update_chart(self, symbol):
+        try:
+            data = self.market_data.get_historical_data(symbol, period='6mo')
+            if not data.empty:
+                self.ax.clear()
+                self.ax.plot(data.index, data['Close'], label='Price')
+                
+                # Dodaj pokretne prosjeke
+                data['MA20'] = data['Close'].rolling(window=20).mean()
+                data['MA50'] = data['Close'].rolling(window=50).mean()
+                self.ax.plot(data.index, data['MA20'], label='20 MA', alpha=0.7)
+                self.ax.plot(data.index, data['MA50'], label='50 MA', alpha=0.7)
 
-    def update_risk_percentage(self, value):
-        self.risk_percentage = float(value)
-        self.risk_label.config(text=f"{self.risk_percentage}%")
+                self.ax.set_title(f"{symbol} Price History")
+                self.ax.set_xlabel("Date")
+                self.ax.set_ylabel("Price ($)")
+                self.ax.legend()
+                self.ax.grid(True)
+                self.fig.autofmt_xdate()
+                self.canvas.draw()
+        except Exception as e:
+            logger.error(f"Error updating chart: {e}")
 
     def calculate_position(self):
-        symbol = self.symbol_entry.get().upper()
-        stop_loss_type = self.stop_loss_type.get()
-        stop_loss_value_str = self.stop_loss_value_entry.get()
-        take_profit_str = self.take_profit_entry.get()
-        entry_price_str = self.entry_price_entry.get()
-        atr_timeframe = self.atr_timeframe.get()  # Get selected ATR timeframe
-
-        if not symbol or not stop_loss_value_str or not take_profit_str or not entry_price_str:
-            messagebox.showwarning("Input Error", "Please fill in all fields.")
-            return
-
         try:
-            stop_loss_value = float(stop_loss_value_str)
-            take_profit = float(take_profit_str)
-            entry_price = float(entry_price_str)
-        except ValueError:
-            messagebox.showwarning("Input Error", "Invalid numeric input.")
-            return
-
-        if stop_loss_type == "Percentage":
-            stop_loss = entry_price * (1 - stop_loss_value / 100)
-        elif stop_loss_type == "ATR":
-            try:
-                # Map timeframe to yfinance interval and period
-                interval_map = {
-                    "5m": ("5m", "5d"),
-                    "15m": ("15m", "15d"),
-                    "1h": ("1h", "30d"),
-                    "1d": ("1d", "6mo"),
-                    "1wk": ("1wk", "1y")
-                }
-                interval, period = interval_map[atr_timeframe]
-                data = yf.download(symbol, period=period, interval=interval)
-                atr = calculate_atr(data)
-                stop_loss = entry_price - atr * stop_loss_value
-                self.atr_label.config(text=f"ATR: {atr:.2f}")
-            except Exception as e:
-                logging.error(f"Error calculating ATR for {symbol}: {e}")
-                messagebox.showerror("Error", f"Error calculating ATR for {symbol}.")
-                return
-
-        position_size = calculate_position_size(self.account_balance, self.risk_percentage, stop_loss, entry_price)
-        risk_per_trade = self.account_balance * (self.risk_percentage / 100)
-        max_loss_per_share = abs(entry_price - stop_loss)
-
-        self.position_size_label.config(text=f"Position Size: {position_size} shares")
-        self.stop_loss_label.config(text=f"Stop Loss: ${stop_loss:.2f}")
-        self.risk_per_trade_label.config(text=f"Risk Per Trade: ${risk_per_trade:.2f}")
-        self.max_loss_per_share_label.config(text=f"Max Loss Per Share: ${max_loss_per_share:.2f}")
-
-        # Confirm Order
-        self.confirm_order(symbol, entry_price, stop_loss, take_profit, position_size)
-
-    def confirm_order(self, symbol, entry_price, stop_loss, take_profit, position_size):
-        message = (
-            f"Symbol: {symbol}\n"
-            f"Entry Price: ${entry_price:.2f}\n"
-            f"Stop Loss: ${stop_loss:.2f}\n"
-            f"Take Profit: ${take_profit:.2f}\n"
-            f"Position Size: {position_size} shares\n"
-            f"Risk Per Trade: ${self.account_balance * (self.risk_percentage / 100):.2f}\n"
-            f"Max Loss Per Share: ${abs(entry_price - stop_loss):.2f}"
-        )
-        response = messagebox.askyesno("Confirm Order", message)
-        if response:
-            self.save_position_to_portfolio(symbol, entry_price, stop_loss, take_profit, position_size)
-
-    def save_position_to_portfolio(self, symbol, entry_price, stop_loss, take_profit, quantity):
-        try:
-            cursor.execute("""
-                INSERT INTO portfolio (symbol, entry_price, stop_loss, take_profit, quantity, entry_date, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (symbol, entry_price, stop_loss, take_profit, quantity, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Open"))
-            conn.commit()
-            messagebox.showinfo("Success", "Position saved to portfolio.")
-            self.portfolio_tracker.refresh()
-            self.plot_historical_data(symbol)
+            entry_price = float(self.entry_price_var.get())
+            stop_loss = float(self.stop_loss_var.get())
+            take_profit = float(self.take_profit_var.get())
+            
+            # Validacija ulaznih podataka
+            if entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
+                raise ValueError("All prices must be greater than 0")
+                
+            position_size = self.risk_manager.calculate_position_size(entry_price, stop_loss)
+            risk_metrics = self.risk_manager.calculate_risk_metrics(
+                position_size, entry_price, stop_loss, take_profit)
+            
+            if risk_metrics:
+                self.position_size_label.config(text=f"Position Size: {position_size} shares")
+                self.risk_amount_label.config(text=f"Risk Amount: ${risk_metrics['total_risk']:.2f}")
+                self.reward_amount_label.config(
+                    text=f"Potential Reward: ${risk_metrics['total_reward']:.2f}")
+                self.risk_reward_label.config(
+                    text=f"Risk/Reward Ratio: {risk_metrics['risk_reward_ratio']:.2f}")
+                
+                # Provjera rizik/reward ratia
+                if risk_metrics['risk_reward_ratio'] < 1:
+                    messagebox.showwarning("Risk Warning", 
+                        "Risk/Reward ratio is less than 1:1. Consider adjusting your entry points.")
+                
+                if messagebox.askyesno("Confirm Trade", "Would you like to save this trade?"):
+                    self.save_trade(position_size)
+                    
+        except ValueError as e:
+            messagebox.showwarning("Input Error", str(e))
         except Exception as e:
-            logging.error(f"Error saving position to portfolio: {e}")
-            messagebox.showerror("Error", "Failed to save position to portfolio.")
-
-    def plot_historical_data(self, symbol):
+            logger.error(f"Error calculating position: {e}")
+            messagebox.showerror("Error", "An error occurred while calculating position.")                
+    def save_trade(self, position_size):
+        db = DatabaseManager()
         try:
-            data = yf.download(symbol, period="6mo", interval="1d")
-            self.ax.clear()
-            self.ax.plot(data.index, data['Close'], label='Close Price', color='blue')
-
-            # Highlight entry date
-            cursor.execute("SELECT entry_date FROM portfolio WHERE symbol = ?", (symbol,))
-            entry_dates = [datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S") for row in cursor.fetchall() if row[0]]
-            for entry_date in entry_dates:
-                self.ax.axvline(x=entry_date, color='green', linestyle='--', label='Entry Date' if entry_dates.index(entry_date) == 0 else "")
-
-            # Highlight exit date
-            cursor.execute("SELECT exit_date FROM portfolio WHERE symbol = ?", (symbol,))
-            exit_dates = [datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S") for row in cursor.fetchall() if row[0]]
-            for exit_date in exit_dates:
-                self.ax.axvline(x=exit_date, color='red', linestyle='--', label='Exit Date' if exit_dates.index(exit_date) == 0 else "")
-
-            self.ax.set_xlabel("Date", fontsize=12)
-            self.ax.set_ylabel("Price ($)", fontsize=12)
-            self.ax.set_title(f"Historical Price Data for {symbol}", fontsize=14)
-            self.ax.legend()
-            self.ax.grid(True)
-            self.canvas.draw()
+            # Validacija podataka prije spremanja
+            symbol = self.symbol_var.get().strip().upper()
+            entry_price = float(self.entry_price_var.get())
+            stop_loss = float(self.stop_loss_var.get())
+            take_profit = float(self.take_profit_var.get())
+            
+            if not symbol or entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
+                raise ValueError("Invalid trade parameters")
+            
+            trade_data = {
+                'symbol': symbol,
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'quantity': position_size,
+                'entry_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'trade_type': self.trade_type.get(),
+                'status': 'Open'
+            }
+            
+            # Debug ispis
+            print("Attempting to save trade with data:")
+            for key, value in trade_data.items():
+                print(f"{key}: {value}")
+            
+            db.execute_query('''
+                INSERT INTO portfolio (
+                    symbol, entry_price, stop_loss, take_profit, quantity,
+                    entry_date, trade_type, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                trade_data['symbol'], trade_data['entry_price'], trade_data['stop_loss'],
+                trade_data['take_profit'], trade_data['quantity'], trade_data['entry_date'],
+                trade_data['trade_type'], trade_data['status']
+            ))
+            
+            messagebox.showinfo("Success", f"Trade saved successfully!\nSymbol: {symbol}\nQuantity: {position_size}")
+            
+            # Osvježi portfolio tracker ako postoji
+            if self.portfolio_tracker:
+                self.portfolio_tracker.refresh()
+                
+        except ValueError as ve:
+            logger.error(f"Validation error in save_trade: {ve}")
+            messagebox.showerror("Validation Error", str(ve))
         except Exception as e:
-            logging.error(f"Error fetching historical data for {symbol}: {e}")
-            messagebox.showerror("Error", f"Failed to fetch historical data for {symbol}.")
+            logger.error(f"Error in save_trade: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Failed to save trade: {str(e)}")
+        finally:
+            db.close()
 
-# Portfolio Tracker Tab
-class PortfolioTrackerTab(ttk.Frame):
-    def __init__(self, parent):
-        super().__init__(parent)
-
-        # Styling
-        style = ttk.Style()
-        style.configure('Treeview', font=('Helvetica', 12))
-        style.configure('Treeview.Heading', font=('Helvetica', 12, 'bold'))
-
-        # Table view
-        columns = ("ID", "Symbol", "Entry Price", "Stop Loss", "Take Profit", "Quantity", "PNL", "Status")
-        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=10)
-        self.tree.column("ID", width=50, anchor="center")  # Hidden ID column
-        self.tree.heading("ID", text="ID")
-        for col in columns[1:]:
-            self.tree.heading(col, text=col)
-            self.tree.column(col, width=120, anchor="center")
-        self.tree.grid(row=0, column=0, columnspan=3, padx=10, pady=10)
-
-        # Buttons
-        self.close_position_button = ttk.Button(self, text="Close Position", command=self.close_position)
-        self.close_position_button.grid(row=1, column=0, pady=10)
-        self.partial_close_button = ttk.Button(self, text="Partial Close", command=self.partial_close)
-        self.partial_close_button.grid(row=1, column=1, pady=10)
-
-        self.load_portfolio()
-
-    def load_portfolio(self):
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        cursor.execute("SELECT id, symbol, entry_price, stop_loss, take_profit, quantity, pnl, status FROM portfolio WHERE status='Open'")
-        rows = cursor.fetchall()
-        for row in rows:
-            self.tree.insert("", tk.END, values=row, iid=str(row[0]))  # Use ID as iid
-
-    def close_position(self):
-        selected_item = self.tree.selection()
-        if not selected_item:
-            messagebox.showwarning("Selection Error", "Please select a position to close.")
-            return
-
-        position_id = selected_item[0]  # Get the hidden ID
-        item = self.tree.item(selected_item)
-        values = item["values"]
-        symbol = values[1]
-        quantity = int(values[5])
-        entry_price = float(values[2])
-
-        # Ask for the quantity to close
-        quantity_to_close_str = simpledialog.askstring("Close Position", f"How many shares of {symbol} would you like to close? (Max: {quantity})")
-        if not quantity_to_close_str:
-            return
-
+    def test_save_trade(self):
+        """Metoda za testiranje spremanja trgovine"""
         try:
-            quantity_to_close = int(quantity_to_close_str)
-            if quantity_to_close <= 0 or quantity_to_close > quantity:
-                raise ValueError("Invalid quantity to close.")
-        except ValueError:
-            messagebox.showwarning("Input Error", "Invalid numeric input for quantity to close.")
-            return
-
-        exit_price = fetch_real_time_price(symbol)
-        if exit_price is None:
-            messagebox.showerror("Error", f"Failed to fetch real-time price for {symbol}.")
-            return
-
-        pnl = (exit_price - entry_price) * quantity_to_close
-        try:
-            if quantity_to_close == quantity:
-                cursor.execute("""
-                    UPDATE portfolio
-                    SET exit_date = ?, pnl = ?, status = 'Closed'
-                    WHERE id = ?
-                """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pnl, position_id))
-            else:
-                cursor.execute("""
-                    INSERT INTO portfolio (symbol, entry_price, stop_loss, take_profit, quantity, entry_date, exit_date, pnl, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (symbol, entry_price, values[3], values[4], quantity_to_close, values[6], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pnl, "Closed"))
-                cursor.execute("""
-                    UPDATE portfolio
-                    SET quantity = ?
-                    WHERE id = ?
-                """, (quantity - quantity_to_close, position_id))
-            conn.commit()
-            self.refresh()
-            messagebox.showinfo("Success", f"Position {symbol} closed for {quantity_to_close} shares.")
+            # Postavi test podatke
+            self.symbol_var.set("AAPL")
+            self.entry_price_var.set("150.0")
+            self.stop_loss_var.set("145.0")
+            self.take_profit_var.set("160.0")
+            self.trade_type.set("Long")
+            
+            # Pokušaj spremanja
+            self.calculate_position()
+            
         except Exception as e:
-            logging.error(f"Error closing position {symbol}: {e}")
-            messagebox.showerror("Error", f"Failed to close position {symbol}.")
+            logger.error(f"Test failed: {e}")
+            print(f"Test failed: {e}")
 
-    def partial_close(self):
-        selected_item = self.tree.selection()
-        if not selected_item:
-            messagebox.showwarning("Selection Error", "Please select a position to partially close.")
-            return
-
-        position_id = selected_item[0]  # Get the hidden ID
-        item = self.tree.item(selected_item)
-        values = item["values"]
-        symbol = values[1]
-        quantity = int(values[5])
-        entry_price = float(values[2])
-
-        # Ask for the quantity to partially close
-        partial_quantity_str = simpledialog.askstring("Partial Close", f"How many shares of {symbol} would you like to partially close? (Max: {quantity})")
-        if not partial_quantity_str:
-            return
-
-        try:
-            partial_quantity = int(partial_quantity_str)
-            if partial_quantity <= 0 or partial_quantity > quantity:
-                raise ValueError("Invalid quantity to partially close.")
-        except ValueError:
-            messagebox.showwarning("Input Error", "Invalid numeric input for quantity to partially close.")
-            return
-
-        exit_price = fetch_real_time_price(symbol)
-        if exit_price is None:
-            messagebox.showerror("Error", f"Failed to fetch real-time price for {symbol}.")
-            return
-
-        pnl = (exit_price - entry_price) * partial_quantity
-        try:
-            cursor.execute("""
-                INSERT INTO portfolio (symbol, entry_price, stop_loss, take_profit, quantity, entry_date, exit_date, pnl, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (symbol, entry_price, values[3], values[4], partial_quantity, values[6], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pnl, "Closed"))
-            cursor.execute("""
-                UPDATE portfolio
-                SET quantity = ?
-                WHERE id = ?
-            """, (quantity - partial_quantity, position_id))
-            conn.commit()
-            self.refresh()
-            messagebox.showinfo("Success", f"Position {symbol} partially closed for {partial_quantity} shares.")
-        except Exception as e:
-            logging.error(f"Error partially closing position {symbol}: {e}")
-            messagebox.showerror("Error", f"Failed to partially close position {symbol}.")
-
-    def refresh(self):
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        self.load_portfolio()
-
-# Closed Trades Tab
+    def clear_fields(self):
+        """Očisti sva polja za unos"""
+        self.symbol_var.set("")
+        self.entry_price_var.set("")
+        self.stop_loss_var.set("")
+        self.take_profit_var.set("")
+        self.trade_type.set("Long")
+        
+        # Očisti labele s rezultatima
+        self.position_size_label.config(text="Position Size: ")
+        self.risk_amount_label.config(text="Risk Amount: ")
+        self.reward_amount_label.config(text="Potential Reward: ")
+        self.risk_reward_label.config(text="Risk/Reward Ratio: ")
+        
+        # Očisti graf
+        self.ax.clear()
+        self.canvas.draw()
 class ClosedTradesTab(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
+        self.setup_ui()
+        self.load_closed_trades()
 
-        # Styling
-        style = ttk.Style()
-        style.configure('Treeview', font=('Helvetica', 12))
-        style.configure('Treeview.Heading', font=('Helvetica', 12, 'bold'))
-
-        # Table view
-        columns = ("Symbol", "Entry Price", "Stop Loss", "Take Profit", "Quantity", "PNL", "Entry Date", "Exit Date", "Status")
+    def setup_ui(self):
+        # Kreiranje Treeview-a za zatvorene trgovine
+        columns = ("ID", "Symbol", "Entry Price", "Exit Price", "Stop Loss",
+                  "Take Profit", "Quantity", "PnL", "Trade Type", "Entry Date", "Exit Date")
+        
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=10)
+        
+        # Konfiguracija stupaca
         for col in columns:
             self.tree.heading(col, text=col)
-            self.tree.column(col, width=120, anchor="center")
-        self.tree.grid(row=0, column=0, columnspan=3, padx=10, pady=10)
+            width = 100 if col not in ["Symbol", "Trade Type"] else 80
+            self.tree.column(col, width=width, anchor="center")
+        
+        # Scrollbars
+        y_scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        x_scroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+        
+        # Pakiranje elemenata
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.load_closed_trades()
+        # Gumb za osvježavanje
+        ttk.Button(self, text="Refresh", 
+                  command=self.load_closed_trades).pack(pady=5)
+
+        # Gumb za izvoz podataka
+        ttk.Button(self, text="Export to CSV", 
+                  command=self.export_closed_trades).pack(pady=5)
 
     def load_closed_trades(self):
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        cursor.execute("SELECT symbol, entry_price, stop_loss, take_profit, quantity, pnl, entry_date, exit_date, status FROM portfolio WHERE status='Closed'")
-        rows = cursor.fetchall()
-        for row in rows:
-            self.tree.insert("", tk.END, values=row)
+        self.tree.delete(*self.tree.get_children())
+        db = DatabaseManager()
+        try:
+            trades = db.execute_query('''
+                SELECT id, symbol, entry_price, exit_price, stop_loss,
+                       take_profit, quantity, pnl, trade_type, entry_date, exit_date
+                FROM portfolio 
+                WHERE status = 'Closed'
+                ORDER BY exit_date DESC
+            ''')
+            
+            for trade in trades:
+                # Formatiraj PnL s bojom
+                pnl = trade[7]
+                pnl_formatted = f"${pnl:.2f}"
+                
+                values = list(trade)
+                values[7] = pnl_formatted
+                
+                # Umetni s tagovima za boju
+                tag = 'profit' if pnl > 0 else 'loss'
+                self.tree.insert("", tk.END, values=values, tags=(tag,))
+            
+            # Konfiguriraj boje tagova
+            self.tree.tag_configure('profit', foreground='green')
+            self.tree.tag_configure('loss', foreground='red')
+            
+        except Exception as e:
+            logger.error(f"Error loading closed trades: {e}")
+            messagebox.showerror("Error", "Failed to load closed trades.")
+        finally:
+            db.close()
 
-    def refresh(self):
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        self.load_closed_trades()
+    def export_closed_trades(self):
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), 
+                      ("Excel files", "*.xlsx")]
+        )
+        if not file_path:
+            return
+            
+        db = DatabaseManager()
+        try:
+            trades = db.execute_query('''
+                SELECT * FROM portfolio 
+                WHERE status = 'Closed'
+                ORDER BY exit_date DESC
+            ''')
+            
+            df = pd.DataFrame(trades, columns=[
+                'ID', 'Symbol', 'Entry Price', 'Exit Price', 'Stop Loss',
+                'Take Profit', 'Quantity', 'Entry Date', 'Exit Date', 'PnL',
+                'Trade Type', 'Status', 'Notes'
+            ])
+            
+            if file_path.endswith('.csv'):
+                df.to_csv(file_path, index=False)
+            else:
+                df.to_excel(file_path, index=False)
+                
+            messagebox.showinfo("Success", "Closed trades exported successfully!")
+        except Exception as e:
+            logger.error(f"Error exporting closed trades: {e}")
+            messagebox.showerror("Error", "Failed to export closed trades.")
+        finally:
+            db.close()
 
-# Trading Statistics Tab
-class TradingStatisticsTab(ttk.Frame):
+class StatisticsTab(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
+        self.setup_ui()
+        self.calculate_statistics()
 
-        self.stats = {
-            "Total Trades": 0,
-            "Win Rate": 0,
-            "Profit Factor": 0,
-            "Expectancy": 0,
-            "Avg Win": 0,
-            "Avg Loss": 0,
-            "Win/Loss Ratio": 0,
-            "Max Drawdown": 0,
-            "Risk/Reward": 0,
-            "Largest Win": 0,
-            "Largest Loss": 0,
-            "Avg Hold (Win)": 0,
-            "Avg Hold (Loss)": 0,
-        }
-        self.labels = {}  # Dictionary to store label references
+    def setup_ui(self):
+        # Glavni okvir za statistiku
+        stats_frame = ttk.LabelFrame(self, text="Trading Performance", padding=10)
+        stats_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Styling
-        style = ttk.Style()
-        style.configure('TLabel', font=('Helvetica', 12))
-        style.configure('TFrame', borderwidth=2, relief="groove")
+        # Ukupna statistika
+        overall_frame = ttk.LabelFrame(stats_frame, text="Overall Statistics", padding=5)
+        overall_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        # Statistics Frame
-        stats_frame = ttk.Frame(self)
-        stats_frame.pack(pady=10, fill="both", expand=True)
-        for i, (key, value) in enumerate(self.stats.items()):
-            label = ttk.Label(stats_frame, text=f"{key}: {value}")
-            label.pack(pady=5)
-            self.labels[key] = label  # Store reference for updating
+        self.total_trades_label = ttk.Label(overall_frame, text="Total Trades: ")
+        self.total_trades_label.pack(pady=2)
 
-        # Balance history chart
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot([], [])
-        canvas = FigureCanvasTkAgg(fig, master=self)
-        canvas_widget = canvas.get_tk_widget()
-        canvas_widget.pack(pady=10, fill="both", expand=True)
-        self.fig = fig
-        self.ax = ax
-        self.canvas = canvas
+        self.winning_trades_label = ttk.Label(overall_frame, text="Winning Trades: ")
+        self.winning_trades_label.pack(pady=2)
 
-        self.update_statistics()
+        self.losing_trades_label = ttk.Label(overall_frame, text="Losing Trades: ")
+        self.losing_trades_label.pack(pady=2)
 
-    def update_statistics(self):
-        cursor.execute("SELECT pnl, status, entry_date, exit_date FROM portfolio")
-        trades = cursor.fetchall()
+        self.win_rate_label = ttk.Label(overall_frame, text="Win Rate: ")
+        self.win_rate_label.pack(pady=2)
 
-        # Filter out None values from pnl
-        trades = [(pnl, status, entry_date, exit_date) for pnl, status, entry_date, exit_date in trades if pnl is not None]
+        # Statistika profita
+        profit_frame = ttk.LabelFrame(stats_frame, text="Profit Statistics", padding=5)
+        profit_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        total_trades = len(trades)
-        wins = [t[0] for t in trades if t[0] > 0 and t[1] == "Closed"]
-        losses = [t[0] for t in trades if t[0] < 0 and t[1] == "Closed"]
+        self.total_pnl_label = ttk.Label(profit_frame, text="Total P&L: ")
+        self.total_pnl_label.pack(pady=2)
 
-        win_rate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
-        profit_factor = sum(wins) / abs(sum(losses)) if sum(losses) != 0 and total_trades > 0 else float('inf')
-        expectancy = (sum(wins) + sum(losses)) / total_trades if total_trades > 0 else 0
-        avg_win = sum(wins) / len(wins) if len(wins) > 0 else 0
-        avg_loss = sum(losses) / len(losses) if len(losses) > 0 else 0
-        win_loss_ratio = avg_win / abs(avg_loss) if avg_loss != 0 and len(losses) > 0 else 0
-        cumulative_pnl = [sum(t[0] for t in trades[:i+1]) for i in range(len(trades))] if trades else [0]
-        max_drawdown = min(cumulative_pnl) if cumulative_pnl else 0
-        risk_reward = avg_win / abs(avg_loss) if avg_loss != 0 and len(losses) > 0 else 0
-        largest_win = max(wins) if wins else 0
-        largest_loss = min(losses) if losses else 0
-        avg_hold_win = np.mean([(pd.to_datetime(t[3]) - pd.to_datetime(t[2])).days for t in trades if t[0] > 0 and t[2] is not None and t[3] is not None]) if wins else 0
-        avg_hold_loss = np.mean([(pd.to_datetime(t[3]) - pd.to_datetime(t[2])).days for t in trades if t[0] < 0 and t[2] is not None and t[3] is not None]) if losses else 0
+        self.profit_factor_label = ttk.Label(profit_frame, text="Profit Factor: ")
+        self.profit_factor_label.pack(pady=2)
 
-        self.stats.update({
-            "Total Trades": total_trades,
-            "Win Rate": f"{win_rate:.1f}%" if total_trades > 0 else "N/A",
-            "Profit Factor": f"{profit_factor:.2f}" if profit_factor != float('inf') else "∞",
-            "Expectancy": f"${expectancy:.2f}",
-            "Avg Win": f"${avg_win:.2f}",
-            "Avg Loss": f"${avg_loss:.2f}",
-            "Win/Loss Ratio": f"{win_loss_ratio:.2f}:1" if win_loss_ratio != 0 else "N/A",
-            "Max Drawdown": f"{max_drawdown*100:.1f}%" if max_drawdown != 0 else "N/A",
-            "Risk/Reward": f"{risk_reward:.2f}:1" if risk_reward != 0 else "N/A",
-            "Largest Win": f"${largest_win:.2f}",
-            "Largest Loss": f"${largest_loss:.2f}",
-            "Avg Hold (Win)": f"{avg_hold_win:.1f} days" if avg_hold_win != 0 else "N/A",
-            "Avg Hold (Loss)": f"{avg_hold_loss:.1f} days" if avg_hold_loss != 0 else "N/A",
-        })
+        self.avg_win_label = ttk.Label(profit_frame, text="Average Win: ")
+        self.avg_win_label.pack(pady=2)
 
-        # Update labels
-        for key, value in self.stats.items():
-            self.labels[key].config(text=f"{key}: {value}")
+        self.avg_loss_label = ttk.Label(profit_frame, text="Average Loss: ")
+        self.avg_loss_label.pack(pady=2)
 
-        # Update chart
-        self.ax.clear()
-        if trades:
-            dates = [pd.to_datetime(t[3]) for t in trades if t[1] == "Closed"]
-            pnls = [t[0] for t in trades if t[1] == "Closed"]
-            self.ax.plot(dates, pnls, marker='o', linestyle='-')
-            self.ax.fill_between(dates, pnls, color='skyblue', alpha=0.3)
-            self.ax.set_xlabel("Date", fontsize=12)
-            self.ax.set_ylabel("PnL ($)", fontsize=12)
-            self.ax.set_title("Balance History", fontsize=14)
-            self.ax.grid(True)
-            self.canvas.draw()
+        self.largest_win_label = ttk.Label(profit_frame, text="Largest Win: ")
+        self.largest_win_label.pack(pady=2)
 
-    def refresh(self):
-        self.update_statistics()
+        self.largest_loss_label = ttk.Label(profit_frame, text="Largest Loss: ")
+        self.largest_loss_label.pack(pady=2)
 
-# Main Application
+        # Rizične statistike
+        risk_frame = ttk.LabelFrame(stats_frame, text="Risk Metrics", padding=5)
+        risk_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.avg_rr_label = ttk.Label(risk_frame, text="Average R:R Ratio: ")
+        self.avg_rr_label.pack(pady=2)
+
+        self.avg_hold_time_label = ttk.Label(risk_frame, text="Average Hold Time: ")
+        self.avg_hold_time_label.pack(pady=2)
+
+        # Gumb za osvježavanje
+        ttk.Button(self, text="Refresh Statistics", 
+                  command=self.calculate_statistics).pack(pady=10)
+
+    def calculate_statistics(self):
+        db = DatabaseManager()
+        try:
+            trades = db.execute_query('''
+                SELECT pnl, entry_date, exit_date, entry_price, exit_price,
+                       stop_loss, take_profit
+                FROM portfolio 
+                WHERE status = 'Closed'
+            ''')
+            
+            if not trades:
+                return
+            
+            # Osnovni izračuni
+            pnls = [t[0] for t in trades]
+            profits = [p for p in pnls if p > 0]
+            losses = [abs(l) for l in pnls if l < 0]
+            
+            total_trades = len(trades)
+            winning_trades = len(profits)
+            losing_trades = len(losses)
+            
+            win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+            
+            # Izračuni profita
+            total_pnl = sum(pnls)
+            profit_factor = sum(profits) / sum(losses) if losses and sum(losses) > 0 else float('inf')
+            
+            avg_win = sum(profits) / len(profits) if profits else 0
+            avg_loss = sum(losses) / len(losses) if losses else 0
+            
+            largest_win = max(profits) if profits else 0
+            largest_loss = max(losses) if losses else 0
+            
+            # Izračun prosječnog R:R omjera
+            rr_ratios = []
+            for trade in trades:
+                entry = trade[3]
+                stop = trade[5]
+                take = trade[6]
+                if entry and stop and take:
+                    risk = abs(entry - stop)
+                    reward = abs(take - entry)
+                    if risk > 0:
+                        rr_ratios.append(reward/risk)
+            
+            avg_rr = sum(rr_ratios) / len(rr_ratios) if rr_ratios else 0
+            
+            # Izračun prosječnog vremena držanja
+            hold_times = []
+            for trade in trades:
+                entry_date = datetime.strptime(trade[1], "%Y-%m-%d %H:%M:%S")
+                exit_date = datetime.strptime(trade[2], "%Y-%m-%d %H:%M:%S")
+                hold_time = exit_date - entry_date
+                hold_times.append(hold_time.total_seconds())
+            
+            avg_hold_time = timedelta(seconds=sum(hold_times)/len(hold_times)) if hold_times else timedelta()
+            
+            # Ažuriranje labela
+            self.total_trades_label.config(text=f"Total Trades: {total_trades}")
+            self.winning_trades_label.config(text=f"Winning Trades: {winning_trades}")
+            self.losing_trades_label.config(text=f"Losing Trades: {losing_trades}")
+            self.win_rate_label.config(text=f"Win Rate: {win_rate:.2f}%")
+            
+            self.total_pnl_label.config(text=f"Total P&L: ${total_pnl:.2f}")
+            self.profit_factor_label.config(text=f"Profit Factor: {profit_factor:.2f}")
+            self.avg_win_label.config(text=f"Average Win: ${avg_win:.2f}")
+            self.avg_loss_label.config(text=f"Average Loss: ${avg_loss:.2f}")
+            self.largest_win_label.config(text=f"Largest Win: ${largest_win:.2f}")
+            self.largest_loss_label.config(text=f"Largest Loss: ${largest_loss:.2f}")
+            
+            self.avg_rr_label.config(text=f"Average R:R Ratio: {avg_rr:.2f}")
+            self.avg_hold_time_label.config(text=f"Average Hold Time: {str(avg_hold_time).split('.')[0]}")
+            
+        except Exception as e:
+            logger.error(f"Error calculating statistics: {e}")
+            messagebox.showerror("Error", "Failed to calculate statistics.")
+        finally:
+            db.close()  
 class TradingApp(ThemedTk):
     def __init__(self):
         super().__init__()
-        self.title("Trading Application")
+        
+        # Osnovna konfiguracija prozora
+        self.title("Trading Application Pro")
         self.geometry("1200x800")
-        self.set_theme("arc")  # Modern theme
+        self.set_theme("arc")  # Moderni theme
+        
+        # Inicijalizacija varijabli računa
+        self.account_balance = tk.DoubleVar(value=10000.0)
+        self.risk_percentage = tk.DoubleVar(value=2.0)
+        
+        # Postavi menu
+        self.setup_menu()
+        
+        # Postavi glavno sučelje
+        self.setup_main_interface()
+        
+        # Logiranje pokretanja aplikacije
+        logger.info("Trading Application started successfully")
 
-        # Initial Cash Balance
-        self.initial_cash_balance = tk.DoubleVar(value=10000)
-        self.risk_percentage = 2
-
-        # Styling
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure('.', font=('Helvetica', 12))
-
-        # Menu Bar
-        self.menu_bar = tk.Menu(self)
-        self.config(menu=self.menu_bar)
-
+    def setup_menu(self):
+        menubar = tk.Menu(self)
+        self.config(menu=menubar)
+        
         # File Menu
-        self.file_menu = tk.Menu(self.menu_bar, tearoff=0)
-        self.file_menu.add_command(label="New Portfolio", command=self.new_portfolio)
-        self.file_menu.add_command(label="Open Portfolio", command=self.open_portfolio)
-        self.file_menu.add_command(label="Save Portfolio", command=self.save_portfolio)
-        self.file_menu.add_command(label="Save Portfolio As...", command=self.save_portfolio_as)
-        self.file_menu.add_separator()
-        self.file_menu.add_command(label="Exit", command=self.quit)
-        self.menu_bar.add_cascade(label="File", menu=self.file_menu)
-
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Settings", command=self.open_settings)
+        file_menu.add_separator()
+        file_menu.add_command(label="Export Data", command=self.export_all_data)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.quit)
+        
+        # View Menu
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="View", menu=view_menu)
+        view_menu.add_command(label="Refresh All", command=self.refresh_all)
+        
         # Help Menu
-        self.help_menu = tk.Menu(self.menu_bar, tearoff=0)
-        self.help_menu.add_command(label="About", command=self.show_about)
-        self.menu_bar.add_cascade(label="Help", menu=self.help_menu)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="Documentation", command=self.show_documentation)
+        help_menu.add_command(label="About", command=self.show_about)
 
-        # Initial Cash Balance Entry
-        balance_frame = ttk.Frame(self)
-        balance_frame.pack(pady=10)
-        ttk.Label(balance_frame, text="Initial Cash Balance:").grid(row=0, column=0, padx=10, pady=10, sticky="e")
-        self.balance_entry = ttk.Entry(balance_frame, textvariable=self.initial_cash_balance)
-        self.balance_entry.grid(row=0, column=1, padx=10, pady=10, sticky="w")
-        ttk.Button(balance_frame, text="Set Balance", command=self.set_initial_balance).grid(row=0, column=2, padx=10, pady=10)
-
-        # Tabs
-        tab_control = ttk.Notebook(self)
-        self.portfolio_tracker = PortfolioTrackerTab(tab_control)
-        self.position_calculator = PositionCalculatorTab(
-            tab_control,
-            account_balance=self.initial_cash_balance.get(),
-            risk_percentage=self.risk_percentage,
-            portfolio_tracker=self.portfolio_tracker
+    def setup_main_interface(self):
+        # Kreiraj notebook za tabove
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Inicijalizacija komponenti
+        self.portfolio_tracker = PortfolioTracker(self.notebook)
+        self.position_calculator = PositionCalculator(
+            self.notebook,
+            self.account_balance.get(),
+            self.risk_percentage.get(),
+            self.portfolio_tracker
         )
-        self.trading_statistics = TradingStatisticsTab(tab_control)
-        self.closed_trades = ClosedTradesTab(tab_control)
-        tab_control.add(self.position_calculator, text="Position Calculator")
-        tab_control.add(self.portfolio_tracker, text="Portfolio Tracker")
-        tab_control.add(self.trading_statistics, text="Trading Statistics")
-        tab_control.add(self.closed_trades, text="Closed Trades")
-        tab_control.pack(expand=1, fill="both")
+        self.closed_trades = ClosedTradesTab(self.notebook)
+        self.statistics = StatisticsTab(self.notebook)
+        
+        # Dodaj tabove
+        self.notebook.add(self.position_calculator, text="Position Calculator")
+        self.notebook.add(self.portfolio_tracker, text="Portfolio")
+        self.notebook.add(self.closed_trades, text="Closed Trades")
+        self.notebook.add(self.statistics, text="Statistics")
+        
+        # Status bar
+        self.status_bar = ttk.Label(
+            self, 
+            text=f"Account Balance: ${self.account_balance.get():,.2f}", 
+            relief=tk.SUNKEN, 
+            anchor=tk.W
+        )
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Start periodic refresh
-        self.periodic_refresh()
+    def open_settings(self):
+        settings_window = tk.Toplevel(self)
+        settings_window.title("Settings")
+        settings_window.geometry("300x200")
+        
+        ttk.Label(settings_window, text="Account Balance:").pack(pady=5)
+        balance_entry = ttk.Entry(settings_window)
+        balance_entry.insert(0, str(self.account_balance.get()))
+        balance_entry.pack(pady=5)
+        
+        ttk.Label(settings_window, text="Risk Percentage:").pack(pady=5)
+        risk_entry = ttk.Entry(settings_window)
+        risk_entry.insert(0, str(self.risk_percentage.get()))
+        risk_entry.pack(pady=5)
+        
+        def save_settings():
+            try:
+                new_balance = float(balance_entry.get())
+                new_risk = float(risk_entry.get())
+                
+                if new_balance <= 0:
+                    raise ValueError("Account balance must be greater than 0")
+                if new_risk <= 0 or new_risk > 100:
+                    raise ValueError("Risk percentage must be between 0 and 100")
+                    
+                self.account_balance.set(new_balance)
+                self.risk_percentage.set(new_risk)
+                self.status_bar.config(text=f"Account Balance: ${new_balance:,.2f}")
+                
+                self.position_calculator.risk_manager = RiskManagement(
+                    new_balance, new_risk/100)
+                
+                settings_window.destroy()
+                messagebox.showinfo("Success", "Settings saved successfully!")
+                
+            except ValueError as e:
+                messagebox.showerror("Error", str(e))
+        
+        ttk.Button(settings_window, text="Save", 
+                  command=save_settings).pack(pady=20)
 
-    def set_initial_balance(self):
+    def export_all_data(self):
         try:
-            balance = float(self.balance_entry.get())
-            self.initial_cash_balance.set(balance)
-            self.position_calculator.account_balance = balance
-            messagebox.showinfo("Success", f"Initial cash balance set to ${balance:.2f}.")
-        except ValueError:
-            messagebox.showwarning("Input Error", "Invalid numeric input for initial cash balance.")
+            export_dir = filedialog.askdirectory(
+                title="Select Directory to Export Data"
+            )
+            if not export_dir:
+                return
+                
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Export open positions
+            self.portfolio_tracker.export_data(
+                f"{export_dir}/open_positions_{timestamp}.csv"
+            )
+            
+            # Export closed trades
+            self.closed_trades.export_closed_trades(
+                f"{export_dir}/closed_trades_{timestamp}.csv"
+            )
+            
+            messagebox.showinfo("Success", "All data exported successfully!")
+            
+        except Exception as e:
+            logger.error(f"Error exporting all data: {e}")
+            messagebox.showerror("Error", "Failed to export data.")
 
-    def periodic_refresh(self):
+    def refresh_all(self):
         try:
             self.portfolio_tracker.refresh()
-            self.trading_statistics.refresh()
-            self.closed_trades.refresh()
+            self.closed_trades.load_closed_trades()
+            self.statistics.calculate_statistics()
+            messagebox.showinfo("Success", "All data refreshed!")
         except Exception as e:
-            logging.error(f"Error during periodic refresh: {e}")
-        self.after(10000, self.periodic_refresh)
+            logger.error(f"Error refreshing all data: {e}")
+            messagebox.showerror("Error", "Failed to refresh data.")
 
-    def new_portfolio(self):
-        """Create a new portfolio."""
-        response = messagebox.askyesno("New Portfolio", "Are you sure you want to create a new portfolio? All unsaved data will be lost.")
-        if response:
-            cursor.execute("DELETE FROM portfolio")
-            conn.commit()
-            self.portfolio_tracker.refresh()
-            self.trading_statistics.refresh()
-            self.closed_trades.refresh()
-            messagebox.showinfo("Success", "New portfolio created.")
-
-    def open_portfolio(self):
-        """Open an existing portfolio."""
-        file_path = filedialog.askopenfilename(
-            title="Open Portfolio",
-            filetypes=[("SQLite Database", "*.db"), ("All Files", "*.*")]
-        )
-        if not file_path:
-            return
-        try:
-            global conn, cursor
-            conn.close()  # Close the current connection
-            conn = sqlite3.connect(file_path, check_same_thread=False)
-            cursor = conn.cursor()
-            # Verify that the database has the required table
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='portfolio'")
-            if not cursor.fetchone():
-                raise ValueError("Invalid portfolio file.")
-            self.portfolio_tracker.refresh()
-            self.trading_statistics.refresh()
-            self.closed_trades.refresh()
-            messagebox.showinfo("Success", f"Portfolio opened from {file_path}.")
-        except Exception as e:
-            logging.error(f"Error opening portfolio: {e}")
-            messagebox.showerror("Error", "Failed to open portfolio.")
-
-    def save_portfolio(self):
-        """Save the current portfolio."""
-        file_path = "trading_app.db"  # Default file path
-        try:
-            conn.commit()
-            messagebox.showinfo("Success", f"Portfolio saved to {file_path}.")
-        except Exception as e:
-            logging.error(f"Error saving portfolio: {e}")
-            messagebox.showerror("Error", "Failed to save portfolio.")
-
-    def save_portfolio_as(self):
-        """Save the current portfolio with a new name."""
-        file_path = filedialog.asksaveasfilename(
-            title="Save Portfolio As",
-            defaultextension=".db",
-            filetypes=[("SQLite Database", "*.db"), ("All Files", "*.*")]
-        )
-        if not file_path:
-            return
-        try:
-            global conn, cursor
-            conn.close()  # Close the current connection
-            conn = sqlite3.connect(file_path, check_same_thread=False)
-            cursor = conn.cursor()
-            # Ensure the 'portfolio' table exists
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS portfolio (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT,
-                    entry_price REAL,
-                    stop_loss REAL,
-                    take_profit REAL,
-                    quantity INTEGER,
-                    entry_date TEXT,
-                    exit_date TEXT,
-                    pnl REAL,
-                    status TEXT
-                )
-            ''')
-
-            # Ensure the 'portfolio' table exists
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS portfolio (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT,
-                    entry_price REAL,
-                    stop_loss REAL,
-                    take_profit REAL,
-                    quantity INTEGER,
-                    entry_date TEXT,
-                    exit_date TEXT,
-                    pnl REAL,
-                    status TEXT
-                )
-            ''')
-            conn.commit()
-
-            messagebox.showinfo("Success", f"Portfolio saved as {file_path}.")
-        except Exception as e:
-            logging.error(f"Error saving portfolio as: {e}")
-            messagebox.showerror("Error", "Failed to save portfolio.")
+    def show_documentation(self):
+        doc_text = """
+        Trading Application Pro Documentation
+        
+        1. Position Calculator
+           - Enter symbol and fetch current price
+           - Set stop loss and take profit levels
+           - Calculate position size based on risk
+           
+        2. Portfolio Tracker
+           - View all open positions
+           - Monitor real-time P&L
+           - Close or modify positions
+           
+        3. Closed Trades
+           - View history of all closed trades
+           - Export trade history
+           
+        4. Statistics
+           - Monitor trading performance
+           - View key metrics and ratios
+        """
+        
+        doc_window = tk.Toplevel(self)
+        doc_window.title("Documentation")
+        doc_window.geometry("600x400")
+        
+        text_widget = tk.Text(doc_window, wrap=tk.WORD, padx=10, pady=10)
+        text_widget.insert(tk.END, doc_text)
+        text_widget.config(state=tk.DISABLED)
+        text_widget.pack(fill=tk.BOTH, expand=True)
 
     def show_about(self):
-        """Show information about the application."""
-        messagebox.showinfo(
-            "About",
-            "Trading Application\nVersion 1.0\nDeveloped by [Your Name]\n© 2023"
+        about_text = """
+        Trading Application Pro
+        Version 1.0.0
+        
+        A professional trading tool for position sizing,
+        portfolio management, and trade analysis.
+        
+        Created by: Garrincha077
+        Last Updated: 2025-02-10
+        """
+        messagebox.showinfo("About", about_text)
+
+def main():
+    try:
+        # Provjera i kreiranje direktorija za logove ako ne postoji
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        
+        # Konfiguracija logginga
+        logging.basicConfig(
+            filename=log_dir / "trading_app.log",
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        # Inicijalizacija baze podataka
+        db = DatabaseManager()
+        db.setup_database()
+        db.close()
+        
+        # Pokretanje aplikacije
+        app = TradingApp()
+        app.mainloop()
+        
+    except Exception as e:
+        logger.critical(f"Application failed to start: {e}", exc_info=True)
+        messagebox.showerror(
+            "Critical Error",
+            "Application failed to start. Please check the log file."
         )
 
 if __name__ == "__main__":
-    app = TradingApp()
-    app.mainloop()
+    main()                                  
