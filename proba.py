@@ -898,7 +898,7 @@ class PositionCalculator(ttk.Frame):
         messagebox.showwarning("Input Error", str(e))
     except Exception as e:
         logger.error(f"Error calculating position: {e}")
-        messagebox.showerror("Error", "An error occurred while calculating position.")                
+        messagebox.showerror("Error", "An error occurred while calculating position.")               
 
 def save_trade(self, position_size):
     db = DatabaseManager()
