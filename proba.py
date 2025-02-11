@@ -27,6 +27,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
 class PartialCloseDialog(tk.Toplevel):
     def __init__(self, parent, max_quantity):
         super().__init__(parent)
@@ -88,6 +89,7 @@ class PartialCloseDialog(tk.Toplevel):
     def cancel(self):
         self.result = False
         self.destroy()
+
 class DatabaseManager:
     def __init__(self, db_path='trading_app.db'):
         self.db_path = db_path
@@ -108,23 +110,23 @@ class DatabaseManager:
         try:
             # Main portfolio table
             self.cursor.execute('''
-    CREATE TABLE IF NOT EXISTS portfolio (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT NOT NULL,
-        entry_price REAL NOT NULL,
-        exit_price REAL,
-        stop_loss REAL,
-        take_profit REAL,
-        quantity INTEGER NOT NULL,
-        entry_date TEXT NOT NULL,
-        exit_date TEXT,
-        pnl REAL,
-        trade_type TEXT NOT NULL,
-        status TEXT NOT NULL,
-        notes TEXT,
-        original_quantity INTEGER
-    )
-''')
+                CREATE TABLE IF NOT EXISTS portfolio (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_price REAL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    quantity INTEGER NOT NULL,
+                    entry_date TEXT NOT NULL,
+                    exit_date TEXT,
+                    pnl REAL,
+                    trade_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    notes TEXT,
+                    original_quantity INTEGER
+                )
+            ''')
 
             # Trading statistics table
             self.cursor.execute('''
@@ -178,6 +180,7 @@ class DatabaseManager:
     def close(self):
         if self.conn:
             self.conn.close()
+
 class MarketDataManager:
     def __init__(self):
         self.cache = {}
@@ -292,6 +295,7 @@ class RiskManagement:
         except Exception as e:
             logger.error(f"Error validating trade: {e}")
             return False, f"Error validating trade: {str(e)}"
+
 class PortfolioTracker(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
@@ -301,8 +305,10 @@ class PortfolioTracker(ttk.Frame):
 
     def setup_ui(self):
         # Glavni okvir za treeview
-        columns = ("ID", "Symbol", "Entry Price", "Current Price", "Stop Loss", 
-                  "Take Profit", "Quantity", "PnL", "PnL %", "Status")
+        columns = (
+            "ID", "Symbol", "Entry Price", "Current Price", "Stop Loss",
+            "Take Profit", "Quantity", "PnL", "PnL %", "Status"
+        )
         
         self.tree = ttk.Treeview(self, columns=columns, show="headings", height=10)
         
@@ -310,7 +316,12 @@ class PortfolioTracker(ttk.Frame):
         self.tree.column("ID", width=50, anchor="center")
         for col in columns[1:]:
             self.tree.heading(col, text=col)
-            width = 100 if col not in ["Symbol", "Status"] else 80
+            if col in ["Symbol", "Status"]:
+                width = 80
+            elif col in ["PnL", "PnL %"]:
+                width = 120
+            else:
+                width = 100
             self.tree.column(col, width=width, anchor="center")
         
         # Sakrivanje ID stupca
@@ -347,22 +358,44 @@ class PortfolioTracker(ttk.Frame):
         try:
             positions = db.execute_query('''
                 SELECT id, symbol, entry_price, stop_loss, take_profit, quantity, 
-                       pnl, status FROM portfolio WHERE status = 'Open'
+                       pnl, status, trade_type 
+                FROM portfolio 
+                WHERE status = 'Open'
+                ORDER BY entry_date DESC
             ''')
             
             for position in positions:
-                position_id, symbol, entry_price = position[0:3]
+                position_id = position[0]
+                symbol = position[1]
+                entry_price = position[2]
+                stop_loss = position[3]
+                take_profit = position[4]
+                quantity = position[5]
+                trade_type = position[8]  # trade_type je na indeksu 8
                 current_price = self.market_data.get_real_time_price(symbol)
                 
                 if current_price:
-                    quantity = position[5]
-                    pnl = (current_price - entry_price) * quantity
+                    # Izračun PnL-a ovisno o vrsti trgovine (Long/Short)
+                    if trade_type == 'Long':
+                        pnl = (current_price - entry_price) * quantity
+                    else:  # Short
+                        pnl = (entry_price - current_price) * quantity
+                    
                     pnl_percentage = (pnl / (entry_price * quantity)) * 100
                     
-                    values = list(position)
-                    values.insert(3, current_price)  # Dodaj trenutnu cijenu
-                    values[6] = f"${pnl:.2f}"       # Formatiraj PnL
-                    values.insert(7, f"{pnl_percentage:.2f}%")  # Dodaj PnL postotak
+                    # Kreiraj listu vrijednosti za prikaz
+                    values = [
+                        position_id,           # ID
+                        symbol,                # Symbol
+                        f"${entry_price:.2f}", # Entry Price
+                        f"${current_price:.2f}", # Current Price
+                        f"${stop_loss:.2f}" if stop_loss else "N/A",    # Stop Loss
+                        f"${take_profit:.2f}" if take_profit else "N/A", # Take Profit
+                        quantity,              # Quantity
+                        f"${pnl:.2f}",        # PnL
+                        f"{pnl_percentage:.2f}%", # PnL %
+                        position[7]            # Status
+                    ]
                     
                     # Dodaj boju ovisno o PnL
                     tag = 'profit' if pnl > 0 else 'loss'
@@ -448,117 +481,173 @@ class PortfolioTracker(ttk.Frame):
             messagebox.showerror("Error", "Failed to close position.")
         finally:
             db.close()
-    def modify_position(self):
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showwarning("Selection Error", "Please select a position to modify.")
-            return
 
-        position = self.tree.item(selected[0])['values']
-        position_id = position[0]
+    def execute_partial_close(self, position_id, close_quantity, exit_price):
+    db = DatabaseManager()
+    try:
+        # Dohvati originalne podatke pozicije
+        position = db.execute_query('''
+            SELECT entry_price, quantity, trade_type, symbol, stop_loss, 
+                   take_profit, entry_date 
+            FROM portfolio 
+            WHERE id = ?
+        ''', (position_id,))[0]
         
-        modify_window = tk.Toplevel(self)
-        modify_window.title("Modify Position")
-        modify_window.geometry("300x200")
+        entry_price, total_quantity, trade_type, symbol, stop_loss, \
+        take_profit, entry_date = position
         
-        ttk.Label(modify_window, text="Stop Loss:").pack(pady=5)
-        stop_loss_entry = ttk.Entry(modify_window)
-        stop_loss_entry.insert(0, str(position[4]))
-        stop_loss_entry.pack(pady=5)
+        remaining_quantity = total_quantity - close_quantity
         
-        ttk.Label(modify_window, text="Take Profit:").pack(pady=5)
-        take_profit_entry = ttk.Entry(modify_window)
-        take_profit_entry.insert(0, str(position[5]))
-        take_profit_entry.pack(pady=5)
+        # Izračunaj PnL za zatvoreni dio
+        pnl = (exit_price - entry_price) * close_quantity if trade_type == 'Long' \
+              else (entry_price - exit_price) * close_quantity
         
-        def save_modifications():
-            try:
-                db = DatabaseManager()
-                db.execute_query('''
-                    UPDATE portfolio
-                    SET stop_loss = ?, take_profit = ?
-                    WHERE id = ?
-                ''', (float(stop_loss_entry.get()), 
-                     float(take_profit_entry.get()), position_id))
-                modify_window.destroy()
-                self.refresh()
-                messagebox.showinfo("Success", "Position updated successfully!")
-            except Exception as e:
-                logger.error(f"Error modifying position: {e}")
-                messagebox.showerror("Error", "Failed to modify position.")
-            finally:
-                db.close()
-        
-        ttk.Button(modify_window, text="Save", 
-                  command=save_modifications).pack(pady=20)
-
-    def add_note(self):
-        selected = self.tree.selection()
-        if not selected:
-            messagebox.showwarning("Selection Error", 
-                                 "Please select a position to add a note.")
-            return
-
-        position_id = self.tree.item(selected[0])['values'][0]
-        note = simpledialog.askstring("Add Note", "Enter note:")
-        
-        if note:
-            db = DatabaseManager()
-            try:
-                db.execute_query('''
-                    INSERT INTO trade_journal (trade_id, entry_date, notes)
-                    VALUES (?, ?, ?)
-                ''', (position_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), note))
-                messagebox.showinfo("Success", "Note added successfully!")
-            except Exception as e:
-                logger.error(f"Error adding note: {e}")
-                messagebox.showerror("Error", "Failed to add note.")
-            finally:
-                db.close()
-
-    def export_data(self):
-        file_path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), 
-                      ("Excel files", "*.xlsx"), 
-                      ("All files", "*.*")]
-        )
-        if not file_path:
-            return
+        if remaining_quantity > 0:
+            # Ažuriraj originalnu poziciju s preostalom količinom
+            db.execute_query('''
+                UPDATE portfolio 
+                SET quantity = ?,
+                    original_quantity = COALESCE(original_quantity, quantity)
+                WHERE id = ?
+            ''', (remaining_quantity, position_id))
             
+            # Kreiraj novi zapis za zatvoreni dio
+            db.execute_query('''
+                INSERT INTO portfolio (
+                    symbol, entry_price, exit_price, stop_loss, take_profit,
+                    quantity, entry_date, exit_date, pnl, trade_type, status,
+                    original_quantity
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (symbol, entry_price, exit_price, stop_loss, take_profit,
+                  close_quantity, entry_date, 
+                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                  pnl, trade_type, 'Closed', close_quantity))
+        else:
+            # Zatvori cijelu poziciju ako je preostala količina 0
+            self.execute_close_position(position_id, exit_price)
+        
+        self.refresh()
+        messagebox.showinfo("Uspjeh", 
+                          f"Zatvoreno {close_quantity} jedinica s PnL: ${pnl:.2f}")
+        
+    except Exception as e:
+        logger.error(f"Error in partial close: {e}")
+        messagebox.showerror("Greška", f"Greška pri zatvaranju pozicije: {str(e)}")
+    finally:
+        db.close()
+
+def modify_position(self):
+    selected = self.tree.selection()
+    if not selected:
+        messagebox.showwarning("Selection Error", "Please select a position to modify.")
+        return
+
+    position = self.tree.item(selected[0])['values']
+    position_id = position[0]
+    
+    modify_window = tk.Toplevel(self)
+    modify_window.title("Modify Position")
+    modify_window.geometry("300x200")
+    
+    ttk.Label(modify_window, text="Stop Loss:").pack(pady=5)
+    stop_loss_entry = ttk.Entry(modify_window)
+    stop_loss_entry.insert(0, str(position[4]))
+    stop_loss_entry.pack(pady=5)
+    
+    ttk.Label(modify_window, text="Take Profit:").pack(pady=5)
+    take_profit_entry = ttk.Entry(modify_window)
+    take_profit_entry.insert(0, str(position[5]))
+    take_profit_entry.pack(pady=5)
+    
+    def save_modifications():
+        try:
+            db = DatabaseManager()
+            db.execute_query('''
+                UPDATE portfolio
+                SET stop_loss = ?, take_profit = ?
+                WHERE id = ?
+            ''', (float(stop_loss_entry.get()), 
+                 float(take_profit_entry.get()), position_id))
+            modify_window.destroy()
+            self.refresh()
+            messagebox.showinfo("Success", "Position updated successfully!")
+        except Exception as e:
+            logger.error(f"Error modifying position: {e}")
+            messagebox.showerror("Error", "Failed to modify position.")
+        finally:
+            db.close()
+    
+    ttk.Button(modify_window, text="Save", 
+              command=save_modifications).pack(pady=20)
+
+def add_note(self):
+    selected = self.tree.selection()
+    if not selected:
+        messagebox.showwarning("Selection Error", 
+                             "Please select a position to add a note.")
+        return
+
+    position_id = self.tree.item(selected[0])['values'][0]
+    note = simpledialog.askstring("Add Note", "Enter note:")
+    
+    if note:
         db = DatabaseManager()
         try:
-            data = db.execute_query('''
-                SELECT * FROM portfolio
-                ORDER BY entry_date DESC
-            ''')
-            
-            df = pd.DataFrame(data, columns=[
-                'ID', 'Symbol', 'Entry Price', 'Exit Price', 'Stop Loss',
-                'Take Profit', 'Quantity', 'Entry Date', 'Exit Date', 'PnL',
-                'Trade Type', 'Status', 'Notes'
-            ])
-            
-            if file_path.endswith('.csv'):
-                df.to_csv(file_path, index=False)
-            else:
-                df.to_excel(file_path, index=False)
-                
-            messagebox.showinfo("Success", "Data exported successfully!")
+            db.execute_query('''
+                INSERT INTO trade_journal (trade_id, entry_date, notes)
+                VALUES (?, ?, ?)
+            ''', (position_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), note))
+            messagebox.showinfo("Success", "Note added successfully!")
         except Exception as e:
-            logger.error(f"Error exporting data: {e}")
-            messagebox.showerror("Error", "Failed to export data.")
+            logger.error(f"Error adding note: {e}")
+            messagebox.showerror("Error", "Failed to add note.")
         finally:
             db.close()
 
-    def refresh(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        self.load_positions()
+def export_data(self):
+    file_path = filedialog.asksaveasfilename(
+        defaultextension=".csv",
+        filetypes=[("CSV files", "*.csv"), 
+                  ("Excel files", "*.xlsx"), 
+                  ("All files", "*.*")]
+    )
+    if not file_path:
+        return
+        
+    db = DatabaseManager()
+    try:
+        data = db.execute_query('''
+            SELECT * FROM portfolio
+            ORDER BY entry_date DESC
+        ''')
+        
+        df = pd.DataFrame(data, columns=[
+            'ID', 'Symbol', 'Entry Price', 'Exit Price', 'Stop Loss',
+            'Take Profit', 'Quantity', 'Entry Date', 'Exit Date', 'PnL',
+            'Trade Type', 'Status', 'Notes'
+        ])
+        
+        if file_path.endswith('.csv'):
+            df.to_csv(file_path, index=False)
+        else:
+            df.to_excel(file_path, index=False)
+            
+        messagebox.showinfo("Success", "Data exported successfully!")
+    except Exception as e:
+        logger.error(f"Error exporting data: {e}")
+        messagebox.showerror("Error", "Failed to export data.")
+    finally:
+        db.close()
 
-    def start_auto_refresh(self):
-        self.refresh()
-        self.after(30000, self.start_auto_refresh)  # Osvježi svakih 30 sekundi
+def refresh(self):
+    for item in self.tree.get_children():
+        self.tree.delete(item)
+    self.load_positions()
+
+def start_auto_refresh(self):
+    self.refresh()
+    self.after(30000, self.start_auto_refresh)  # Osvježi svakih 30 sekundi
+
 class PositionCalculator(ttk.Frame):
     def __init__(self, parent, account_balance=10000.0, risk_percentage=2.0, portfolio_tracker=None):
         super().__init__(parent)
@@ -776,128 +865,130 @@ class PositionCalculator(ttk.Frame):
             logger.error(f"Error updating chart: {e}")
 
     def calculate_position(self):
-        try:
-            entry_price = float(self.entry_price_var.get())
-            stop_loss = float(self.stop_loss_var.get())
-            take_profit = float(self.take_profit_var.get())
+    try:
+        entry_price = float(self.entry_price_var.get())
+        stop_loss = float(self.stop_loss_var.get())
+        take_profit = float(self.take_profit_var.get())
+        
+        # Validacija ulaznih podataka
+        if entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
+            raise ValueError("All prices must be greater than 0")
             
-            # Validacija ulaznih podataka
-            if entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
-                raise ValueError("All prices must be greater than 0")
+        position_size = self.risk_manager.calculate_position_size(entry_price, stop_loss)
+        risk_metrics = self.risk_manager.calculate_risk_metrics(
+            position_size, entry_price, stop_loss, take_profit)
+        
+        if risk_metrics:
+            self.position_size_label.config(text=f"Position Size: {position_size} shares")
+            self.risk_amount_label.config(text=f"Risk Amount: ${risk_metrics['total_risk']:.2f}")
+            self.reward_amount_label.config(
+                text=f"Potential Reward: ${risk_metrics['total_reward']:.2f}")
+            self.risk_reward_label.config(
+                text=f"Risk/Reward Ratio: {risk_metrics['risk_reward_ratio']:.2f}")
+            
+            # Provjera rizik/reward ratia
+            if risk_metrics['risk_reward_ratio'] < 1:
+                messagebox.showwarning("Risk Warning", 
+                    "Risk/Reward ratio is less than 1:1. Consider adjusting your entry points.")
+            
+            if messagebox.askyesno("Confirm Trade", "Would you like to save this trade?"):
+                self.save_trade(position_size)
                 
-            position_size = self.risk_manager.calculate_position_size(entry_price, stop_loss)
-            risk_metrics = self.risk_manager.calculate_risk_metrics(
-                position_size, entry_price, stop_loss, take_profit)
-            
-            if risk_metrics:
-                self.position_size_label.config(text=f"Position Size: {position_size} shares")
-                self.risk_amount_label.config(text=f"Risk Amount: ${risk_metrics['total_risk']:.2f}")
-                self.reward_amount_label.config(
-                    text=f"Potential Reward: ${risk_metrics['total_reward']:.2f}")
-                self.risk_reward_label.config(
-                    text=f"Risk/Reward Ratio: {risk_metrics['risk_reward_ratio']:.2f}")
-                
-                # Provjera rizik/reward ratia
-                if risk_metrics['risk_reward_ratio'] < 1:
-                    messagebox.showwarning("Risk Warning", 
-                        "Risk/Reward ratio is less than 1:1. Consider adjusting your entry points.")
-                
-                if messagebox.askyesno("Confirm Trade", "Would you like to save this trade?"):
-                    self.save_trade(position_size)
-                    
-        except ValueError as e:
-            messagebox.showwarning("Input Error", str(e))
-        except Exception as e:
-            logger.error(f"Error calculating position: {e}")
-            messagebox.showerror("Error", "An error occurred while calculating position.")                
-    def save_trade(self, position_size):
-        db = DatabaseManager()
-        try:
-            # Validacija podataka prije spremanja
-            symbol = self.symbol_var.get().strip().upper()
-            entry_price = float(self.entry_price_var.get())
-            stop_loss = float(self.stop_loss_var.get())
-            take_profit = float(self.take_profit_var.get())
-            
-            if not symbol or entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
-                raise ValueError("Invalid trade parameters")
-            
-            trade_data = {
-                'symbol': symbol,
-                'entry_price': entry_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'quantity': position_size,
-                'entry_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'trade_type': self.trade_type.get(),
-                'status': 'Open'
-            }
-            
-            # Debug ispis
-            print("Attempting to save trade with data:")
-            for key, value in trade_data.items():
-                print(f"{key}: {value}")
-            
-            db.execute_query('''
-                INSERT INTO portfolio (
-                    symbol, entry_price, stop_loss, take_profit, quantity,
-                    entry_date, trade_type, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                trade_data['symbol'], trade_data['entry_price'], trade_data['stop_loss'],
-                trade_data['take_profit'], trade_data['quantity'], trade_data['entry_date'],
-                trade_data['trade_type'], trade_data['status']
-            ))
-            
-            messagebox.showinfo("Success", f"Trade saved successfully!\nSymbol: {symbol}\nQuantity: {position_size}")
-            
-            # Osvježi portfolio tracker ako postoji
-            if self.portfolio_tracker:
-                self.portfolio_tracker.refresh()
-                
-        except ValueError as ve:
-            logger.error(f"Validation error in save_trade: {ve}")
-            messagebox.showerror("Validation Error", str(ve))
-        except Exception as e:
-            logger.error(f"Error in save_trade: {e}", exc_info=True)
-            messagebox.showerror("Error", f"Failed to save trade: {str(e)}")
-        finally:
-            db.close()
+    except ValueError as e:
+        messagebox.showwarning("Input Error", str(e))
+    except Exception as e:
+        logger.error(f"Error calculating position: {e}")
+        messagebox.showerror("Error", "An error occurred while calculating position.")                
 
-    def test_save_trade(self):
-        """Metoda za testiranje spremanja trgovine"""
-        try:
-            # Postavi test podatke
-            self.symbol_var.set("AAPL")
-            self.entry_price_var.set("150.0")
-            self.stop_loss_var.set("145.0")
-            self.take_profit_var.set("160.0")
-            self.trade_type.set("Long")
+def save_trade(self, position_size):
+    db = DatabaseManager()
+    try:
+        # Validacija podataka prije spremanja
+        symbol = self.symbol_var.get().strip().upper()
+        entry_price = float(self.entry_price_var.get())
+        stop_loss = float(self.stop_loss_var.get())
+        take_profit = float(self.take_profit_var.get())
+        
+        if not symbol or entry_price <= 0 or stop_loss <= 0 or take_profit <= 0:
+            raise ValueError("Invalid trade parameters")
+        
+        trade_data = {
+            'symbol': symbol,
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'quantity': position_size,
+            'entry_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'trade_type': self.trade_type.get(),
+            'status': 'Open'
+        }
+        
+        # Debug ispis
+        print("Attempting to save trade with data:")
+        for key, value in trade_data.items():
+            print(f"{key}: {value}")
+        
+        db.execute_query('''
+            INSERT INTO portfolio (
+                symbol, entry_price, stop_loss, take_profit, quantity,
+                entry_date, trade_type, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            trade_data['symbol'], trade_data['entry_price'], trade_data['stop_loss'],
+            trade_data['take_profit'], trade_data['quantity'], trade_data['entry_date'],
+            trade_data['trade_type'], trade_data['status']
+        ))
+        
+        messagebox.showinfo("Success", f"Trade saved successfully!\nSymbol: {symbol}\nQuantity: {position_size}")
+        
+        # Osvježi portfolio tracker ako postoji
+        if self.portfolio_tracker:
+            self.portfolio_tracker.refresh()
             
-            # Pokušaj spremanja
-            self.calculate_position()
-            
-        except Exception as e:
-            logger.error(f"Test failed: {e}")
-            print(f"Test failed: {e}")
+    except ValueError as ve:
+        logger.error(f"Validation error in save_trade: {ve}")
+        messagebox.showerror("Validation Error", str(ve))
+    except Exception as e:
+        logger.error(f"Error in save_trade: {e}", exc_info=True)
+        messagebox.showerror("Error", f"Failed to save trade: {str(e)}")
+    finally:
+        db.close()
 
-    def clear_fields(self):
-        """Očisti sva polja za unos"""
-        self.symbol_var.set("")
-        self.entry_price_var.set("")
-        self.stop_loss_var.set("")
-        self.take_profit_var.set("")
+def test_save_trade(self):
+    """Metoda za testiranje spremanja trgovine"""
+    try:
+        # Postavi test podatke
+        self.symbol_var.set("AAPL")
+        self.entry_price_var.set("150.0")
+        self.stop_loss_var.set("145.0")
+        self.take_profit_var.set("160.0")
         self.trade_type.set("Long")
         
-        # Očisti labele s rezultatima
-        self.position_size_label.config(text="Position Size: ")
-        self.risk_amount_label.config(text="Risk Amount: ")
-        self.reward_amount_label.config(text="Potential Reward: ")
-        self.risk_reward_label.config(text="Risk/Reward Ratio: ")
+        # Pokušaj spremanja
+        self.calculate_position()
         
-        # Očisti graf
-        self.ax.clear()
-        self.canvas.draw()
+    except Exception as e:
+        logger.error(f"Test failed: {e}")
+        print(f"Test failed: {e}")
+
+def clear_fields(self):
+    """Očisti sva polja za unos"""
+    self.symbol_var.set("")
+    self.entry_price_var.set("")
+    self.stop_loss_var.set("")
+    self.take_profit_var.set("")
+    self.trade_type.set("Long")
+    
+    # Očisti labele s rezultatima
+    self.position_size_label.config(text="Position Size: ")
+    self.risk_amount_label.config(text="Risk Amount: ")
+    self.reward_amount_label.config(text="Potential Reward: ")
+    self.risk_reward_label.config(text="Risk/Reward Ratio: ")
+    
+    # Očisti graf
+    self.ax.clear()
+    self.canvas.draw()
+
 class ClosedTradesTab(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
@@ -1144,8 +1235,10 @@ class StatisticsTab(ttk.Frame):
         except Exception as e:
             logger.error(f"Error calculating statistics: {e}")
             messagebox.showerror("Error", "Failed to calculate statistics.")
+        ```python
         finally:
-            db.close()  
+            db.close()
+
 class TradingApp(ThemedTk):
     def __init__(self):
         super().__init__()
@@ -1376,4 +1469,4 @@ def main():
         )
 
 if __name__ == "__main__":
-    main()                                  
+    main()
